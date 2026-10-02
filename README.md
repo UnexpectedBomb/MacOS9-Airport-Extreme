@@ -1,7 +1,7 @@
 # MacOS9-Airport-Extreme
 
 A **Mac OS 9 driver for the Apple AirPort Extreme card (Broadcom BCM4306)**: 802.11g with
-**WPA2-Personal and open networks**, on a Power Mac G4 running Mac OS 9.2.2.
+**WPA2-Personal and open networks**, for G4 Macs that did not originally support natively booting Mac OS 9.2.2.
 
 Apple shipped no OS 9 driver for the AirPort Extreme card, and the original 802.11b AirPort card tops out
 at WEP, which no modern network accepts. This driver puts a real, modern Wi-Fi connection on an OS 9 Mac
@@ -30,8 +30,7 @@ Three native OS 9 pieces:
   `14e4:4320`). Not every card sold as "AirPort Extreme" is a BCM4306: the later Wi-Fi/Bluetooth combo cards
   (A1126 / A1127) use the **BCM4318** (`14e4:4318`), which this driver does not support. The driver checks
   the card at start-up and steps aside cleanly if it is not a BCM4306, so an unsupported card does no harm.
-- **Broadcom firmware**: proprietary, not included here. See [firmware/README.md](firmware/README.md) for
-  the one-line fetch (the same blobs Linux and the BSDs use).
+- Broadcom firmware is already embedded in the pre-built driver on the Releases page, so if you use the download there is nothing extra to fetch. Only when you build from source do you retrieve it yourself, a one-line fetch described in firmware/README.md.
 
 ## Install
 
