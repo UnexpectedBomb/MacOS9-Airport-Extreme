@@ -1,0 +1,48 @@
+diff --git a/PEFTools/MakePEF.cc b/PEFTools/MakePEF.cc
+index f2ee393154..ffc37fa49c 100755
+--- a/PEFTools/MakePEF.cc
++++ b/PEFTools/MakePEF.cc
+@@ -210,12 +210,39 @@ class ExportTable
+         table.clear();
+         table.resize(sz);
+ 
++        // CFM does NOT index the export hash table with a plain mask. It folds the hash word:
++        //
++        //     index = (hashWord ^ (hashWord >> tablePower)) & (tableSize - 1)
++        //
++        // This code used `key % sz`. The two agree only while bit `tablePower` of the word is
++        // clear, so every symbol with that bit set was written into a bucket CFM never looks in:
++        // present in the fragment, named in the .exp file, and invisible to FindSymbol.
++        //
++        // The loop above keeps ONE bucket until a fragment has ten exports, which is why this
++        // went unnoticed for so long -- with sz == 1 both rules trivially give 0. The bug appears
++        // at the tenth export, and it strands whichever symbols happen to have the bit set, NOT
++        // the one just added. Found 2026-09-21: adding a tenth export to an OS 9 AirPort driver
++        // silently broke two accessors that had not been touched in weeks, and CFM reported them
++        // as missing -- indistinguishable from a forgotten line in the .exp file.
++        //
++        // Verified against that hardware run: the fold predicts exactly which symbols CFM can and
++        // cannot find, 9 of 9 correct, while the plain mask predicts all ten resolve and is
++        // contradicted twice. Two other candidate folds were tested and contradicted 8 and 6
++        // times respectively.
++        //
++        // This is a no-op for any fragment with nine or fewer exports (sz == 1, so both rules
++        // yield 0) -- i.e. for every fragment previously built with this tool.
++        const size_t power = power_;
++        auto bucket = [power, sz](uint32_t key) -> size_t {
++            return (size_t)((key ^ (key >> power)) & (uint32_t)(sz - 1));
++        };
++
+         std::sort(symbols.begin(), symbols.end(),
+-            [sz](const auto& a, const auto& b) { return a.key % sz < b.key % sz; });
+-        
++            [&bucket](const auto& a, const auto& b) { return bucket(a.key) < bucket(b.key); });
++
+         for(const auto& sym : symbols)
+-            table[sym.key % sz] += 1 << 18;
+-        
++            table[bucket(sym.key)] += 1 << 18;
++
+         int off = 0;
+ 
+         for(auto& slot : table)

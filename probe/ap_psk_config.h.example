@@ -1,0 +1,40 @@
+/* ap_psk_config.h.example -- copy to ap_psk_config.h and put your own passphrase in it.
+ *
+ *     cp ap_psk_config.h.example ap_psk_config.h
+ *     # then edit ap_psk_config.h
+ *
+ * ⚠⚠ ap_psk_config.h IS GITIGNORED AND I DO NOT READ IT.
+ *
+ * Handling your passphrase in plain text is a hard limit for me, the same one that had you type
+ * the password into the router console yourself when we created the test network on 2026-09-18. That
+ * limit does not evaporate because the secret would be convenient to have. So the arrangement is:
+ * you fill this in, it never enters the repository and never enters my context, and I build
+ * against it without looking at it. If I ever need to see a value derived from it, the probe
+ * prints what is safe to print and nothing else.
+ *
+ * ★ AND THERE IS NO PRECOMPUTED PMK HERE, DELIBERATELY.
+ * MINIMAL-STA-SCOPE.md §1 suggested computing PBKDF2 on the Mac and embedding the 32-byte PMK
+ * as a resource, so the 4096 SHA-1 iterations never run on the G4. That optimisation is now
+ * measured to be unnecessary: PBKDF2(4096, 32 bytes) takes 8.13 ms on the development Mac, so
+ * even at 30-60x slower it is roughly 0.3 to 1 second on a 1.25 GHz G4 -- a one-off cost paid
+ * once when joining a network, not something in a data path.
+ *
+ * Dropping it is worth more than the second it costs. A precomputed PMK is password-equivalent
+ * for this SSID: anyone holding it can join the network and decrypt its traffic. Embedding one
+ * in a build artefact would mean a credential living in a .bin that gets copied to a file share
+ * and carried between machines. Computing it at runtime from a gitignored source file keeps the
+ * secret in exactly one place on exactly one disk.
+ */
+#ifndef AP_PSK_CONFIG_H
+#define AP_PSK_CONFIG_H
+
+/* The SSID must match the network exactly -- it is the PBKDF2 salt, so a single wrong character
+ * yields a PMK that is wrong in every byte, with no diagnostic other than a failed MIC. */
+#define AP_PSK_SSID      "YourNetworkName"
+#define AP_PSK_SSID_LEN  15
+
+/* Your WPA2 passphrase. 8 to 63 printable ASCII characters. */
+#define AP_PSK_PASSPHRASE     "put-your-passphrase-here"
+#define AP_PSK_PASSPHRASE_LEN 24
+
+#endif /* AP_PSK_CONFIG_H */

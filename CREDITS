@@ -1,0 +1,32 @@
+AirPort Extreme driver for Mac OS 9 -- credits and provenance
+=============================================================
+
+This is an independent, unofficial driver. It was built by studying and adapting the
+following free/open implementations of the Broadcom BCM4306 radio and of WPA2. It is
+released under the GNU General Public License v2 (see LICENSE), in recognition of the
+GPL-licensed sources it draws on.
+
+Reverse-engineering and port references
+---------------------------------------
+* Linux b43 / b43legacy  (GPL-2.0)
+    drivers/net/wireless/broadcom/b43/ -- BCM43xx PHY and radio bring-up, the DMA ring
+    geometry, and MAC / microcode handling.
+* FreeBSD / OpenBSD / DragonFly BSD  bwi(4)  (BSD-2-Clause)
+    The reference implementation for this exact card (BCM4306, "v3" firmware), and the
+    source of the firmware-fetch instructions in firmware/README.md.
+* Linux mac80211  (GPL-2.0)
+    Scan excursion timing and the power-save null-frame handshake.
+* hostapd / wpa_supplicant, the hostap project  (BSD)
+    WPA2-Personal: PBKDF2-HMAC-SHA1, the 4-way-handshake key derivation (PTK/GTK) and
+    CCMP, adapted for the G4.
+
+Firmware
+--------
+Broadcom BCM4306 microcode is proprietary to Broadcom and is NOT distributed here. See
+firmware/README.md for how to obtain it -- the same position the Linux distributions and
+the BSD ports take.
+
+Trademarks
+----------
+AirPort and AirPort Extreme are trademarks of Apple Inc. This project is independent and
+is not affiliated with, authorized by, or endorsed by Apple.

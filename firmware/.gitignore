@@ -1,0 +1,11 @@
+# ⚠ The firmware blobs are NOT committed. They are proprietary Broadcom microcode redistributed by
+# the bwi author; OpenBSD's ports tree marks them PERMIT_PACKAGE/PERMIT_DISTFILES = proprietary.
+# Keeping a local copy to upload into hardware you own is ordinary; committing them to a repo is
+# redistribution, and this repo's visibility could change. Linux distributions and FreeBSD ports
+# take the same position: ship the fetch, not the blob.
+#
+# See README.md in this directory for the URL, the SHA-256, and the verification we ran.
+v3.tbz
+v3/
+v4.tar.bz2
+v4/
