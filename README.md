@@ -39,16 +39,15 @@ The three pieces are available ready to install on the [Releases](../../releases
 them (they are BinHex `.hqx` files; StuffIt Expander on OS 9 handles them). Or build them yourself (see
 [Building](#building)). Either way:
 
-1. Put the driver (**AirPort Extreme Driver**) in the **Extensions** folder. If you installed an earlier
-   build that was named `AirPortExtreme.shlb`, remove it first; two copies of the same driver fragment
-   must not be present at once.
+1. Put the driver (**AirPort Extreme Driver**) in the **Extensions** folder.
 2. Put the **AirPort Extreme** control panel in **Control Panels**.
 3. Put **AirPort Extreme Strip** in **Control Strip Modules**.
 4. Restart. In the **TCP/IP** control panel choose *Connect via: AirPort Extreme* and close it to save.
+5. Use the AirPort Extreme control panel to connect to your wireless network.
 
 ## Compatibility
 
-Only the **Power Mac G4 MDD FW800** has been tested on real hardware, but it should work on any OS
+Only the **Power Mac G4 MDD FW800** has been tested and confirmed working, but it should work on any OS
 9.2.2 Mac fitted with a **BCM4306** AirPort Extreme card. The table lists the OS 9-capable G4s that took the
 discrete **A1026** card: all are expected to work, and I will move the "No" to "Yes" as confirmation reports are received.
 
@@ -82,7 +81,7 @@ This driver is independent and runs alongside Apple's original AirPort software,
 remove Apple's AirPort extensions. It claims the AirPort Extreme (BCM4306) card as its own Open Transport
 port (`OTModl$AirPortBCM`), separate from Apple's driver for the original 802.11b card.
 
-One caveat, and it is an Apple bug rather than this driver's: Apple's **AirPort AP** extension crashes at
+One important note due to a bug on Apple's part: Apple's **AirPort AP** extension crashes at
 startup if the **TCP/IP Preferences** file is missing or corrupt *and* no original 802.11b AirPort card is
 present. If you do not use an original AirPort card you can safely remove **AirPort AP** and **AirPort AP
 Support**; **AirPort Driver** can stay (it just finds no card and idles). And do not delete TCP/IP
