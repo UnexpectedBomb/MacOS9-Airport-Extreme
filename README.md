@@ -48,11 +48,9 @@ them (they are BinHex `.hqx` files; StuffIt Expander on OS 9 handles them). Or b
 
 ## Compatibility
 
-Only the **Power Mac G4 MDD FW800** has been tested on real hardware. The driver no longer assumes that
-machine's antenna wiring (it lets the card pick its antenna automatically), so it should work on any OS
+Only the **Power Mac G4 MDD FW800** has been tested on real hardware, but it should work on any OS
 9.2.2 Mac fitted with a **BCM4306** AirPort Extreme card. The table lists the OS 9-capable G4s that took the
-discrete **A1026** card: all are expected to work, but only the MDD FW800 is confirmed. Every other row
-needs a community report to move from No to Yes.
+discrete **A1026** card: all are expected to work, and I will move the "No" to "Yes" as confirmation reports are received.
 
 | Model | Model ID | Confirmed working |
 |---|---|---|
@@ -73,7 +71,7 @@ needs a community report to move from No to Yes.
 reporting PCI ID `14e4:4320` or `14e4:4325` is a BCM4306 and will be driven; `14e4:4318` is a BCM4318 and is
 declined cleanly. These machines use only the BCM4318 combo card (A1126/A1127) and are **not supported**:
 Mac mini G4 (Late 2005, PowerMac10,2), iBook G4 Mid 2005 (PowerBook6,7), Al PowerBook G4 DLSD
-(PowerBook5,8 / 5,9). The Xserve G4 had no AirPort option.
+(PowerBook5,8 / 5,9) (support might be added in the future if I get a machine to test on). The Xserve G4 had no AirPort option.
 
 Reports of success or failure are very welcome: please say which Mac, which card and its PCI ID, and what
 happened.
