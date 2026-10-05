@@ -1,7 +1,7 @@
 # MacOS9-Airport-Extreme
 
 A **Mac OS 9 driver for the Apple AirPort Extreme card (Broadcom BCM4306)**: 802.11g with
-**WPA2-Personal and open networks**, for G4 Macs that did not originally support natively booting Mac OS 9.2.2.
+**WPA2-Personal and open networks**, on a Power Mac G4 running Mac OS 9.2.2.
 
 Apple shipped no OS 9 driver for the AirPort Extreme card, and the original 802.11b AirPort card tops out
 at WEP, which no modern network accepts. This driver puts a real, modern Wi-Fi connection on an OS 9 Mac
@@ -24,13 +24,15 @@ Three native OS 9 pieces:
 
 ## Requirements
 
-- A Mac that boots **Mac OS 9.2.2**. The **Power Mac G4 MDD FW800** (`PowerMac3,6`) is the tested machine;
+- A Mac that boots **Mac OS 9.2.2**. The **Power Mac G4 MDD FW800** (`PowerMac3,6`) is the primary tested machine;
   see [Compatibility](#compatibility) for other machines.
 - A **Broadcom BCM4306-based AirPort Extreme card**. The common one is Apple's **A1026** (BCM4306, PCI ID
   `14e4:4320`). Not every card sold as "AirPort Extreme" is a BCM4306: the later Wi-Fi/Bluetooth combo cards
   (A1126 / A1127) use the **BCM4318** (`14e4:4318`), which this driver does not support. The driver checks
   the card at start-up and steps aside cleanly if it is not a BCM4306, so an unsupported card does no harm.
-- Broadcom firmware is already embedded in the pre-built driver on the Releases page, so if you use the download there is nothing extra to fetch. Only when you build from source do you retrieve it yourself, a one-line fetch described in firmware/README.md.
+- **Broadcom firmware** is already embedded in the pre-built driver on the [Releases](../../releases) page,
+  so if you use the download there is nothing extra to fetch. Only when you build from source do you retrieve
+  it yourself, a one-line fetch described in [firmware/README.md](firmware/README.md).
 
 ## Install
 
@@ -38,17 +40,21 @@ The three pieces are available ready to install on the [Releases](../../releases
 them (they are BinHex `.hqx` files; StuffIt Expander on OS 9 handles them). Or build them yourself (see
 [Building](#building)). Either way:
 
-1. Put the driver (**AirPort Extreme Driver**) in the **Extensions** folder.
+1. Put the driver (**AirPort Extreme Driver**) in the **Extensions** folder. If you installed an earlier
+   build that was named `AirPortExtreme.shlb`, remove it first; two copies of the same driver fragment
+   must not be present at once.
 2. Put the **AirPort Extreme** control panel in **Control Panels**.
 3. Put **AirPort Extreme Strip** in **Control Strip Modules**.
 4. Restart. In the **TCP/IP** control panel choose *Connect via: AirPort Extreme* and close it to save.
-5. Use the AirPort Extreme control panel to connect to your wireless network.
 
 ## Compatibility
 
-Only the **Power Mac G4 MDD FW800** has been tested and confirmed working, but it should work on any OS
-9.2.2 Mac fitted with a **BCM4306** AirPort Extreme card. The table lists the OS 9-capable G4s that took the
-discrete **A1026** card: all are expected to work, and I will move the "No" to "Yes" as confirmation reports are received.
+Two machines are confirmed on real hardware so far: the **Power Mac G4 MDD FW800** (the development machine,
+where WPA2-Personal and open joins were tested) and a **14-inch iBook G4** (2004, `PowerBook6,5`), the latter from a
+community report. The driver no longer assumes the MDD's antenna wiring (it lets the card pick its antenna
+automatically), so it should work on any OS 9.2.2 Mac fitted with a **BCM4306** AirPort Extreme card. The
+table lists the OS 9-capable G4s that took the discrete **A1026** card: all are expected to work, but only
+the rows marked Yes are confirmed. Every other row needs a community report to move from No to Yes.
 
 | Model | Model ID | Confirmed working |
 |---|---|---|
@@ -58,7 +64,8 @@ discrete **A1026** card: all are expected to work, and I will move the "No" to "
 | iMac G4 15-inch 1.0GHz | PowerMac6,3 | No |
 | iMac G4 17/20-inch 1.25GHz | PowerMac6,3 | No |
 | Mac mini G4 (Early 2005) | PowerMac10,1 | No |
-| iBook G4 (2003-2004, Radeon 9200) | PowerBook6,3 / 6,5 | No |
+| iBook G4 (2004, Radeon 9200) | PowerBook6,5 | Yes |
+| iBook G4 (2003, Radeon 9200) | PowerBook6,3 | No |
 | Al PowerBook G4 12-inch 867MHz | PowerBook6,1 | No |
 | Al PowerBook G4 12-inch 1.0-1.5GHz | PowerBook6,2 / 6,4 / 6,8 | No |
 | Al PowerBook G4 17-inch 1.0GHz | PowerBook5,1 | No |
@@ -69,7 +76,7 @@ discrete **A1026** card: all are expected to work, and I will move the "No" to "
 reporting PCI ID `14e4:4320` or `14e4:4325` is a BCM4306 and will be driven; `14e4:4318` is a BCM4318 and is
 declined cleanly. These machines use only the BCM4318 combo card (A1126/A1127) and are **not supported**:
 Mac mini G4 (Late 2005, PowerMac10,2), iBook G4 Mid 2005 (PowerBook6,7), Al PowerBook G4 DLSD
-(PowerBook5,8 / 5,9) (support might be added in the future if I get a machine to test on). The Xserve G4 had no AirPort option.
+(PowerBook5,8 / 5,9). The Xserve G4 had no AirPort option.
 
 Reports of success or failure are very welcome: please say which Mac, which card and its PCI ID, and what
 happened.
@@ -80,7 +87,7 @@ This driver is independent and runs alongside Apple's original AirPort software,
 remove Apple's AirPort extensions. It claims the AirPort Extreme (BCM4306) card as its own Open Transport
 port (`OTModl$AirPortBCM`), separate from Apple's driver for the original 802.11b card.
 
-One important note due to a bug on Apple's part: Apple's **AirPort AP** extension crashes at
+One caveat, and it is an Apple bug rather than this driver's: Apple's **AirPort AP** extension crashes at
 startup if the **TCP/IP Preferences** file is missing or corrupt *and* no original 802.11b AirPort card is
 present. If you do not use an original AirPort card you can safely remove **AirPort AP** and **AirPort AP
 Support**; **AirPort Driver** can stay (it just finds no card and idles). And do not delete TCP/IP
@@ -99,7 +106,7 @@ Not supported: WEP, the original WPA/TKIP, WPA3-only (SAE), or 802.1X / Enterpri
 
 ## Limitations
 
-- Tested only on the MDD FW800; other machines rely on community reports (see [Compatibility](#compatibility)).
+- Confirmed on the MDD FW800 and a 14-inch iBook G4; other machines rely on community reports (see [Compatibility](#compatibility)).
 - No hidden-network ("closed SSID" / manual "Other...") entry yet.
 - With a base station that presents several BSSIDs for one SSID, a join may occasionally come back from a
   different BSSID of the same network; this is being hardened.
