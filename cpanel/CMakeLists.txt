@@ -89,6 +89,32 @@ if(NOT _nshort EQUAL 2 OR NOT _nlong EQUAL 2)
     message(FATAL_ERROR "ap_panel.r: both 'vers' resources must carry PANEL_VER ${PANEL_VER} in both strings "
                         "(short=${_nshort}/2, long=${_nlong}/2)")
 endif()
+# ...and the two NUMERIC BCD bytes at the head of each 'vers' (major, then minor<<4 | bugfix). Apple System
+# Profiler reads and formats THESE, not the strings, so a bump that touches only the strings leaves ASP
+# showing the old number -- this panel shipped reading 1.4.5 in ASP while Get Info showed 1.4.8. Build the
+# expected pair from PANEL_VER and require it in both resources. Single-digit major, nibble fields (guarded).
+string(REPLACE "." ";" _vparts "${PANEL_VER}")
+list(LENGTH _vparts _nparts)
+if(NOT _nparts EQUAL 3)
+    message(FATAL_ERROR "PANEL_VER must be major.minor.bugfix (got '${PANEL_VER}')")
+endif()
+list(GET _vparts 0 _vmaj)
+list(GET _vparts 1 _vmin)
+list(GET _vparts 2 _vbug)
+if(_vmaj GREATER 9 OR _vmin GREATER 15 OR _vbug GREATER 15)
+    message(FATAL_ERROR "ap_panel.r 'vers' numeric guard needs widening for PANEL_VER '${PANEL_VER}'")
+endif()
+math(EXPR _bcd_lo_dec "(${_vmin} * 16) + ${_vbug}")
+math(EXPR _bcd_lo "${_bcd_lo_dec}" OUTPUT_FORMAT HEXADECIMAL)
+string(TOLOWER "${_bcd_lo}" _bcd_lo)
+string(REGEX REPLACE "^0x(.)$" "0x0\\1" _bcd_lo "${_bcd_lo}")   # zero-pad 0x5 -> 0x05
+set(_bcd_pair "0x0${_vmaj}, ${_bcd_lo},")                        # e.g. "0x01, 0x48,"
+string(REGEX MATCHALL "${_bcd_pair}" _bcd_hits "${_rsrc}")
+list(LENGTH _bcd_hits _nbcd)
+if(NOT _nbcd EQUAL 2)
+    message(FATAL_ERROR "ap_panel.r: both 'vers' numeric fields must begin '${_bcd_pair}' for PANEL_VER "
+                        "'${PANEL_VER}' (found ${_nbcd}/2). ASP formats these BCD bytes, not the strings.")
+endif()
 # ...and the About box, which says the version in ap_panel.c.
 file(READ ${CMAKE_CURRENT_SOURCE_DIR}/ap_panel.c _src)
 string(FIND "${_src}" "#define kPanelVersion  \"${PANEL_VER}\"" _about)

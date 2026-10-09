@@ -40,18 +40,20 @@ resource 'SIZE' (-1) {
 /* 'vers' defined inline, as ../csm/ap_csm.r does. vers(1) is what Get Info and Apple System Profiler read
  * (bluetooth/cpanel lost ASP's "Version" column without it); vers(2) is the same, for the Finder's
  * package line. Safe in an application: the "vers(1) breaks boot" hazard is ROM-only.
- * ⚠ BOTH resources carry PANEL_VER in BOTH strings; CMakeLists.txt checks. */
+ * ⚠ BOTH resources carry PANEL_VER in the two NUMERIC BCD bytes (0xMM, 0xmb) AND in both strings. ASP
+ * reads and formats the NUMERIC; Get Info shows the long string -- bumping only the strings shipped this
+ * panel reading 1.4.5 in ASP while Get Info said 1.4.8. CMakeLists.txt now checks all three. */
 type 'vers' {
     hex byte; hex byte; hex byte; hex byte; integer; pstring; pstring;
 };
 resource 'vers' (1) {
-    0x01, 0x45, 0x80, 0x00,
+    0x01, 0x48, 0x80, 0x00,
     0,
     "1.4.8",
     "1.4.8 - AirPort Extreme status, on/off, choosing a network, forgetting one, and an About box"
 };
 resource 'vers' (2) {
-    0x01, 0x45, 0x80, 0x00,
+    0x01, 0x48, 0x80, 0x00,
     0,
     "1.4.8",
     "1.4.8 - AirPort Extreme status, on/off, choosing a network, forgetting one, and an About box"
