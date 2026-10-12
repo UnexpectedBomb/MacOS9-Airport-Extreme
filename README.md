@@ -1,10 +1,10 @@
 # MacOS9-Airport-Extreme
 
-A **Mac OS 9 driver for Broadcom BCM4306 and BCM4318 802.11g cards**: 802.11g with
-**WPA2-Personal and open networks**, on a Power Mac G4 running Mac OS 9.2.2. It drives both the Apple
-AirPort Extreme card (BCM4306) and the single-chip BCM4318 used on later cards and PCI/CardBus adapters.
+A **Mac OS 9 driver for Broadcom BCM4306 and BCM4318 802.11g cards** to connect with
+**WPA2-Personal and open networks**, on Macs running Mac OS 9.2.2. It drives the Apple
+AirPort Extreme card (A1026) as well as Linksys WMP54GS (PCI) and WPC54G (CardBus) adapters.
 
-Apple shipped no OS 9 driver for the AirPort Extreme card, and the original 802.11b AirPort card tops out
+Apple never shipped an OS 9 driver for the AirPort Extreme card, and the original 802.11b AirPort card tops out
 at WEP, which no modern network accepts. This driver puts a real, modern Wi-Fi connection on an OS 9 Mac
 with its own hardware: it scans, joins WPA2-secured or open networks, remembers them, and rejoins on its
 own at start-up, all from a native control panel and Control Strip module, with no Mac OS X involved.
