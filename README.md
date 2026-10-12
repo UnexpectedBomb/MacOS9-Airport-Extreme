@@ -1,7 +1,8 @@
 # MacOS9-Airport-Extreme
 
-A **Mac OS 9 driver for the Apple AirPort Extreme card (Broadcom BCM4306)**: 802.11g with
-**WPA2-Personal and open networks**, on a Power Mac G4 running Mac OS 9.2.2.
+A **Mac OS 9 driver for Broadcom BCM4306 and BCM4318 802.11g cards**: 802.11g with
+**WPA2-Personal and open networks**, on a Power Mac G4 running Mac OS 9.2.2. It drives both the Apple
+AirPort Extreme card (BCM4306) and the single-chip BCM4318 used on later cards and PCI/CardBus adapters.
 
 Apple shipped no OS 9 driver for the AirPort Extreme card, and the original 802.11b AirPort card tops out
 at WEP, which no modern network accepts. This driver puts a real, modern Wi-Fi connection on an OS 9 Mac
@@ -9,15 +10,16 @@ with its own hardware: it scans, joins WPA2-secured or open networks, remembers 
 own at start-up, all from a native control panel and Control Strip module, with no Mac OS X involved.
 
 > **Status: working on real hardware.** WPA2-Personal and open-network joins are tested on a Power Mac G4
-> MDD FW800 with an A1026 card. It is a hobby project, offered as-is; see [Limitations](#limitations).
+> MDD with an A1026 (BCM4306) card, and -- new in this release -- on a BCM4318 PCI card (Linksys WMP54GS)
+> at full 802.11g speed. It is a hobby project, offered as-is; see [Limitations](#limitations).
 
 ## What you get
 
 Three native OS 9 pieces:
 
-- **AirPort Extreme** (system extension): the driver. BCM4306 bring-up, an 802.11 station stack, a
-  WPA2-Personal supplicant (PBKDF2 / 4-way handshake / CCMP), and the Open Transport DLPI glue so TCP/IP
-  runs over it like any Ethernet port.
+- **AirPort Extreme** (system extension): the driver. BCM4306 and BCM4318 bring-up, an 802.11 station
+  stack, a WPA2-Personal supplicant (PBKDF2 / 4-way handshake / CCMP), and the Open Transport DLPI glue so
+  TCP/IP runs over it like any Ethernet port.
 - **AirPort Extreme** (control panel): signal and status, on/off, scan and choose a network, enter a
   password once, forget a network, and an About box.
 - **AirPort Extreme Strip** (Control Strip module): signal, on/off, and choosing a network from the strip.
@@ -26,10 +28,11 @@ Three native OS 9 pieces:
 
 - A Mac that boots **Mac OS 9.2.2**. The **Power Mac G4 MDD FW800** (`PowerMac3,6`) is the primary tested machine;
   see [Compatibility](#compatibility) for other machines.
-- A **Broadcom BCM4306-based AirPort Extreme card**. The common one is Apple's **A1026** (BCM4306, PCI ID
-  `14e4:4320`). Not every card sold as "AirPort Extreme" is a BCM4306: the later Wi-Fi/Bluetooth combo cards
-  (A1126 / A1127) use the **BCM4318** (`14e4:4318`), which this driver does not support. The driver checks
-  the card at start-up and steps aside cleanly if it is not a BCM4306, so an unsupported card does no harm.
+- A **Broadcom BCM4306 or BCM4318 802.11g card**. The common BCM4306 is Apple's **A1026** (PCI ID
+  `14e4:4320`); the **BCM4318** (`14e4:4318`) is the later single-chip part, used on the A1126 / A1127
+  Wi-Fi/Bluetooth combo cards and on PCI/CardBus adapters such as the Linksys WMP54GS. **Both are driven.**
+  The driver checks the card at start-up and steps aside cleanly if it is neither, so an unsupported card
+  does no harm.
 - **Broadcom firmware** is already embedded in the pre-built driver on the [Releases](../../releases) page,
   so if you use the download there is nothing extra to fetch. Only when you build from source do you retrieve
   it yourself, a one-line fetch described in [firmware/README.md](firmware/README.md).
@@ -49,12 +52,15 @@ them (they are BinHex `.hqx` files; StuffIt Expander on OS 9 handles them). Or b
 
 ## Compatibility
 
-Two machines are confirmed on real hardware so far: the **Power Mac G4 MDD FW800** (the development machine,
-where WPA2-Personal and open joins were tested) and a **14-inch iBook G4** (2004, `PowerBook6,5`), the latter from a
-community report. The driver no longer assumes the MDD's antenna wiring (it lets the card pick its antenna
-automatically), so it should work on any OS 9.2.2 Mac fitted with a **BCM4306** AirPort Extreme card. The
-table lists the OS 9-capable G4s that took the discrete **A1026** card: all are expected to work, but only
-the rows marked Yes are confirmed. Every other row needs a community report to move from No to Yes.
+Confirmed on real hardware so far: the **Power Mac G4 MDD FW800** (the development machine, where
+WPA2-Personal and open joins were tested) and a **14-inch iBook G4** (2004, `PowerBook6,5`), the latter from
+a community report -- both with the BCM4306 AirPort Extreme card. Beyond the internal A1026, add-in Broadcom
+cards are confirmed too: the **BCM4318** on a BCM4318 **PCI** card (Linksys WMP54GS) at full 802.11g speed,
+and the **BCM4306** on a **CardBus** card in a TiBook (PowerBook G4) and even a **PowerBook G3 "Wallstreet"**.
+The driver no longer assumes the MDD's antenna wiring (it lets the card pick its antenna automatically), so
+it should work on any OS 9.2.2 Mac fitted with a supported Broadcom card. The table lists the OS 9-capable
+G4s that took the discrete **A1026** card: all are expected to work, but only the rows marked Yes are
+confirmed. Every other row needs a community report to move from No to Yes.
 
 | Model | Model ID | Confirmed working |
 |---|---|---|
@@ -71,12 +77,13 @@ the rows marked Yes are confirmed. Every other row needs a community report to m
 | Al PowerBook G4 17-inch 1.0GHz | PowerBook5,1 | No |
 | Al PowerBook G4 15/17-inch (Radeon) | PowerBook5,2-5,7 | No |
 
-**Check your card, not just your Mac.** The A1026 card shipped in two chip revisions: early cards are the
-**BCM4306** (supported); later ones are the **BCM4318** (not supported). In Apple System Profiler, a card
-reporting PCI ID `14e4:4320` or `14e4:4325` is a BCM4306 and will be driven; `14e4:4318` is a BCM4318 and is
-declined cleanly. These machines use only the BCM4318 combo card (A1126/A1127) and are **not supported**:
-Mac mini G4 (Late 2005, PowerMac10,2), iBook G4 Mid 2005 (PowerBook6,7), Al PowerBook G4 DLSD
-(PowerBook5,8 / 5,9). The Xserve G4 had no AirPort option.
+**Check your card.** The A1026 card shipped in two chip revisions, and **both are now driven**: early cards
+are the **BCM4306** (`14e4:4320` or `14e4:4325`), later ones the **BCM4318** (`14e4:4318`). In Apple System
+Profiler any of those three PCI IDs is supported. BCM4318 support is new in this release and is confirmed on
+a BCM4318 **PCI** card (Linksys WMP54GS) at full 802.11g speed; the A1126/A1127 combo cards built into later
+machines -- Mac mini G4 (Late 2005, PowerMac10,2), iBook G4 Mid 2005 (PowerBook6,7), Al PowerBook G4 DLSD
+(PowerBook5,8 / 5,9) -- are the same chip and are **expected to work but have not yet been tested**; a report
+from one would be very welcome. The Xserve G4 had no AirPort option.
 
 Reports of success or failure are very welcome: please say which Mac, which card and its PCI ID, and what
 happened.
@@ -106,7 +113,8 @@ Not supported: WEP, the original WPA/TKIP, WPA3-only (SAE), or 802.1X / Enterpri
 
 ## Limitations
 
-- Confirmed on the MDD FW800 and a 14-inch iBook G4; other machines rely on community reports (see [Compatibility](#compatibility)).
+- Confirmed on the MDD FW800 and a 14-inch iBook G4 (BCM4306), on a BCM4318 PCI card, and on BCM4306 CardBus
+  cards (TiBook and a PowerBook G3); other machines rely on community reports (see [Compatibility](#compatibility)).
 - No hidden-network ("closed SSID" / manual "Other...") entry yet.
 - With a base station that presents several BSSIDs for one SSID, a join may occasionally come back from a
   different BSSID of the same network; this is being hardened.

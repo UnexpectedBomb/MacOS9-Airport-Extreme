@@ -95,6 +95,12 @@
 #define kVendorBroadcom   0x14E4UL
 #define kDevBCM4306_4320  0x4320UL
 #define kDevBCM4306_4325  0x4325UL
+#define kDevBCM4318       0x4318UL   /* BCM4318 single-chip 802.11g (PCI 14e4:4318) */
+
+/* b235: the BCM4318 is now a FULLY SUPPORTED chip (14e4:4318, single-chip 802.11g), not a diagnostic
+ * probe -- its rev-8 radio init, OFDM/ExtG init and full 802.11g throughput are HW-proven on the FW400.
+ * SsbFindAndMap binds, and ap_shim accepts, BOTH the BCM4306 (4320/4325) and the BCM4318 (4318); the old
+ * AP_DIAG_ANYCHIP flag (bind a 4318 only to read its revs, then abort) is retired. */
 
 #define kAddrEntryWords   5
 #define AA_REG(physhi)    ((physhi) & 0xFF)
@@ -213,7 +219,8 @@ static OSStatus SsbFindAndMap(SsbBus *bus)
       sz=sizeof(vid); if(RegistryPropertyGet(&e,"vendor-id",&vid,&sz)!=noErr) continue;
       if((vid&0xFFFFUL)!=kVendorBroadcom) continue;
       sz=sizeof(did); if(RegistryPropertyGet(&e,"device-id",&did,&sz)!=noErr) continue;
-      did&=0xFFFFUL; if(did!=kDevBCM4306_4320&&did!=kDevBCM4306_4325) continue;
+      did&=0xFFFFUL;
+      if(did!=kDevBCM4306_4320 && did!=kDevBCM4306_4325 && did!=kDevBCM4318) continue;
       bus->node=e; found=1; break; }
     RegistryEntryIterateDispose(&c);
     if(!found) return -1;

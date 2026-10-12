@@ -26,7 +26,7 @@
 /* Freshness witness for THIS part of the deliverable: the init beacon carries this number, so
  * reading airport-otmodl-init == AP_OTMODL_BUILD proves this exact module loaded (not a stale one).
  * [[feedback_freshness_witness_outside_the_test]] -- one witness per part of a multi-part ship. */
-#define AP_OTMODL_BUILD  219
+#define AP_OTMODL_BUILD  235
 
 /* ★★★ 8-61: k163 SAFE DIAGNOSTIC. Hold RX delivery OFF -- count the whole path but do NOT hand
  * frames to OT, so there is no corruption and no crash. With the module stable, the boot vehicle's

@@ -314,11 +314,10 @@ static void ApShimScanBackplane(void)
       gShimNCores   = gBus.nCores;
       gShimIdx80211 = (SInt32)gBus.idx80211;
       gShimIdxCC    = (SInt32)gBus.idxChipCommon;
-      /* k218 belt-and-braces: SsbFindAndMap already binds only PCI 14e4:4320/4325 (BCM4306), so a
-       * BCM4318 (e.g. a later A1026 or an A1126/A1127 combo) is declined before this -- but assert the
-       * ChipCommon id is 0x4306 too, so any unexpected chip is declined cleanly rather than driven on
-       * BCM4306 assumptions. On the supported card chipId == 0x4306, so this never fires. */
-      if(gShimChipId != 0x4306UL) gShimScanErr = paramErr; }
+      /* Belt-and-braces: assert the ChipCommon id is a SUPPORTED chip -- BCM4306 (0x4306) or BCM4318
+       * (0x4318) -- so any unexpected chip is declined cleanly rather than driven on wrong assumptions.
+       * SsbFindAndMap already binds only 14e4:4320/4325/4318, so this is a second line of defence. */
+      if(gShimChipId != 0x4306UL && gShimChipId != 0x4318UL) gShimScanErr = paramErr; }
 
     /* ⚠ Restore on EVERY path, including the failure one. A scan that gave up halfway has still
      * moved the window, and leaving it parked on an arbitrary core is exactly how a later,
@@ -893,6 +892,20 @@ static void ApShimChipInitTail(void)
     Say1("    core rev = ",(unsigned long)gShimCoreRev);
     Say1("    phy rev  = ",(unsigned long)gShimPhyRev);
 
+    /* Supported chips are the BCM4306 (0x4306) and the BCM4318 (0x4318); SsbFindAndMap and the
+     * chip-accept gate already declined anything else. The 4318 needs no special tail handling --
+     * hardware power control is a no-op on it (has_hardware_pctl false) and its rev-8 radio / OFDM
+     * init is done in b43_phy_initg -- so bring-up simply continues. Log which chip bound. */
+    if(gBus.chipId != 0x4306UL && gBus.chipId != 0x4318UL){
+      /* Unreachable (the accept gate declined it); never run radio/DMA init on an unexpected chip. */
+      gShimPhyErr = paramErr; gShimTailErr = paramErr; return;
+    }
+    if(gBus.chipId == 0x4318UL){
+      Say("");
+      Say1("  BCM4318 bound.  core rev = ",(unsigned long)gShimCoreRev);
+      Say1("    phy rev = ",(unsigned long)gShimPhyRev);
+    }
+
     ChipInitTail(gShimCoreRev,(UInt16)gShimPhyRev,gBus.chipId,gBus.chipRev,
                  &gShimTailMacctl,&gShimTailPretbtt);
 
@@ -974,7 +987,7 @@ static void ApShimCoreInitMid(void)
     static const UInt8 kOfdmMb[8] = { 6,9,12,18,24,36,48,54 };
     UInt32 savedWin = 0;
     int haveSaved, i, bad = 0;
-    UInt16 ctl = (UInt16)(B43_TXH_PHY_ENC_CCK | B43_TXH_PHY_ANT01AUTO | B43_TXH_PHY_TXPWR);
+    UInt16 ctl = (UInt16)(B43_TXH_PHY_ENC_CCK | AP_TX_ANT | B43_TXH_PHY_TXPWR);
 
     if(gShimTailErr != noErr) return;            /* b43 runs these only after a completed chip_init */
     haveSaved = (ExpMgrConfigReadLong(&gBus.node,(LogicalAddress)SSB_BAR0_WIN,&savedWin) == noErr);
@@ -987,6 +1000,25 @@ static void ApShimCoreInitMid(void)
     Say("");
     Say("  [8-2e2] b43_wireless_core_init's middle (k194) -- the statements this port had skipped");
     ShmWrite16Shared(B43_SHM_SH_WLCOREREV,(UInt16)gShimCoreRev);
+
+    /* b43 main.c:4882-4886: a host flag keyed on the B2050 radio revision, written here because b43
+     * does its hf_read/hf_write right after WLCOREREV. The 4318 (radio rev 6) wants TSSI-based tx
+     * power -- B43_HF_4318TSSI (bit 21 of the 48-bit host flags -> HOSTF2 bit 5). The 4306 (rev 2)
+     * would instead take B43_HF_VCORECALC, but this driver's 4306 bring-up is HW-validated (k219)
+     * with NO host flags, so we set ONLY the 4318 arm and leave the 4306 path byte-for-byte
+     * unchanged; full G-PHY host-flag parity (SYMW/GDCW/VCORECALC) is a separate, 4306-re-validated
+     * change tracked in BCM4318-SUPPORT-PLAN.md. The gShimRadio* globals are populated by now: the
+     * radio-id read (ApShimPhyInit) runs before this (ApShimCoreInitMid) -- ap_shim.c:6034 vs 6036. */
+    if(Wants4318Tssi(gShimRadioVer,gShimRadioRev)){
+      UInt16 hlo=0,hmi=0,hhi=0;
+      HfRead(&hlo,&hmi,&hhi);
+      hmi |= 0x0020U;                             /* B43_HF_4318TSSI = 0x200000 -> HOSTF2 |= 0x0020 */
+      HfWrite(hlo,hmi,hhi);
+      HfRead(&hlo,&hmi,&hhi);                      /* decode the read-back, never a bare write */
+      Say1("    [4318] HOSTF2 (B43_HF_4318TSSI) = ",(unsigned long)hmi);
+      if(!(hmi & 0x0020U)) bad++;
+    }
+
     ShmWrite16Scratch(B43_SHM_SC_SRLIMIT,7);                 /* b43_set_retry_limits(dev, 7, 4) */
     ShmWrite16Scratch(B43_SHM_SC_LRLIMIT,4);
     ShmWrite16Shared(B43_SHM_SH_SFFBLIM,3);
@@ -1672,9 +1704,9 @@ UInt32 AirPortShimTxProbe(void)
      * antSel, ackReq). antSel 0 is b43's default antenna; ackReq 1 is what makes the AP answer,
      * and an ACK is this increment's entire oracle -- a unicast frame with ackReq 0 would be
      * transmitted and never acknowledged, which would look exactly like a broken transmitter. */
-    /* ⚠ B43_TXH_PHY_ANT01AUTO, not 0. The app's comment on the identical call says this is
+    /* ⚠ AP_TX_ANT, not 0. The app's comment on the identical call says this is
      * "exactly what the directed probe request used, which we know draws an ACK from this AP". */
-    GenerateTxHdr351(gShimTxHdr,gShimTxFrm,flen,gShimChannel,0xC000,B43_TXH_PHY_ANT01AUTO,1);
+    GenerateTxHdr351(gShimTxHdr,gShimTxFrm,flen,gShimChannel,0xC000,AP_TX_ANT,1);
     ApShimTxArm();
     Say1("    frame length = ",(unsigned long)flen);
     DmaPublish();
@@ -2062,7 +2094,7 @@ UInt32 AirPortShimAuth(void)
      *   memory of a previous boot, which is the entire point. */
     { UInt16 dlen = BuildDeauth(gShimTxFrm,gShimMac,gShimTgtBssid);
       GenerateTxHdr351(gShimTxHdr,gShimTxFrm,dlen,gShimChannel,0xC00D,
-                       B43_TXH_PHY_ANT01AUTO,1);
+                       AP_TX_ANT,1);
       ApShimTxArm();
       Say1("    [8-31] deauth first, to clear stale AP state. length = ",(unsigned long)dlen);
       DmaPublish();
@@ -2077,7 +2109,7 @@ UInt32 AirPortShimAuth(void)
      * the PHY transmits. Reusing 8-3a's header would send the probe request's 42 bytes for an
      * auth frame of a different size -- k49 lost a run to exactly that. */
     flen = BuildAuthRequest(gShimTxFrm,gShimMac,gShimTgtBssid);
-    GenerateTxHdr351(gShimTxHdr,gShimTxFrm,flen,gShimChannel,0xC001,B43_TXH_PHY_ANT01AUTO,1);
+    GenerateTxHdr351(gShimTxHdr,gShimTxFrm,flen,gShimChannel,0xC001,AP_TX_ANT,1);
     ApShimTxArm();                 /* ⚠ without this the doorbell does not ring -- see k79 */
     Say1("    auth request length = ",(unsigned long)flen);
     DmaPublish();
@@ -2213,7 +2245,7 @@ UInt32 AirPortShimAssoc(void)
     }
 
     GenerateTxHdr351(gShimTxHdr,gShimTxFrm,blen,gShimChannel,0xC020,
-                     B43_TXH_PHY_ANT01AUTO,1);
+                     AP_TX_ANT,1);
     ApShimTxArm();
     DmaPublish();
     PostTxFrameAt(gShimTxBase,gShimTxRing.base,0,
@@ -2387,7 +2419,7 @@ static void ApShimSendM2(void)
     Say ("      Key Data is the RSNE, byte-identical to the association request's -- the AP");
     Say ("      compares them and aborts if they differ at all.");
     GenerateTxHdr351(gShimTxHdr,gShimTxFrm,m2len,gShimChannel,0xC030,
-                     B43_TXH_PHY_ANT01AUTO,1);
+                     AP_TX_ANT,1);
     ApShimTxArm();
     DmaPublish();
     PostTxFrameAt(gShimTxBase,gShimTxRing.base,0,
@@ -2690,7 +2722,7 @@ UInt32 AirPortShimHandshake(void)
       Say1("    message 4 bytes = ",(unsigned long)m4len);
       Say ("      Zero nonce and no Key Data, both by the standard.");
       GenerateTxHdr351(gShimTxHdr,gShimTxFrm,m4len,gShimChannel,0xC040,
-                       B43_TXH_PHY_ANT01AUTO,1);
+                       AP_TX_ANT,1);
       ApShimTxArm();
       DmaPublish();
       PostTxFrameAt(gShimTxBase,gShimTxRing.base,0,
@@ -4212,7 +4244,7 @@ static OSStatus ApShimTxCore(const UInt8 *eth, UInt32 ethLen, int *isDhcpOut, co
         /* k200: the header is built from the STAGED frame (GenerateTxHdr351Rate only READS it: frame
          * control, duration, addr1) -- the same bytes the ring buffer is about to receive. */
         GenerateTxHdr351Rate(gTxrHdr[txBuf],gTxStage,(UInt16)encLen,gShimChannel,gTxLastCookie,
-                             B43_TXH_PHY_ANT01AUTO,1,kTxRates[r].ofdm,kTxRates[r].code,
+                             AP_TX_ANT,1,kTxRates[r].ofdm,kTxRates[r].code,
                              kTxRates[fb].ofdm,kTxRates[fb].code);
         gTxRateSent[r]++;
     }
@@ -5207,11 +5239,18 @@ static UInt32 ApScanListenChannel(UInt8 chan, UInt32 dwellMs)
     return took;
 }
 
-/* The channels a 2.4 GHz scan listens on. 1-11 are usable in every regulatory domain; 12-13 are left out
- * rather than guessed (they are lawful to LISTEN on, but this driver has no country information to know it,
- * and the omission only hides two channels almost nothing in North America uses). */
+/* The channels a 2.4 GHz scan LISTENS on. Passive listening is lawful in every regulatory domain across
+ * 1-13 (it is receive-only), so the sweep now runs 1-13 rather than stopping at 11. A network on channel
+ * 12 or 13 is otherwise INVISIBLE to us even when it is in range and broadcasting -- and the scan capping
+ * at 11 was the one thing in the driver that could hide an in-range AP. (68kmla "obsolete" 2026-10: a
+ * network that never appeared in the list; nominally North America is 1-11, but routers do land on 12-13
+ * through region/auto settings, and that was the remaining explanation for an AP we could not see.) We
+ * only ever TRANSMIT on a channel a target network was actually FOUND on, so extending the PASSIVE sweep
+ * adds no transmit on 12-13 for anyone whose own network sits on 1-11. Channel 14 stays out on purpose:
+ * it is Japan-only and CCK-only, and b43's channel-14 (country-code / ACPR) switch arm is deliberately
+ * not ported (see GphyChannelSwitch in ap_bringup.h). */
 #define AP_SCAN_CHAN_LO   1u
-#define AP_SCAN_CHAN_HI  11u
+#define AP_SCAN_CHAN_HI  13u
 #define AP_SCAN_DWELL_MS 120UL          /* per channel: a beacon interval is ~100 ms, so one is almost sure */
 
 /* Listen on every channel, building gScanTab. The caller has quiesced the receive interrupt (or it is not
@@ -5389,7 +5428,7 @@ static void ApShimTxNull(int pm)
     UInt16 n = (UInt16)ApBuildNullFunc(nf, gShimMac, gShimTgtBssid, pm);
     int k;
     for(k = 0; k < (int)n; k++) gShimTxFrm[k] = nf[k];
-    GenerateTxHdr351(gShimTxHdr, gShimTxFrm, n, gShimChannel, 0xC00F, B43_TXH_PHY_ANT01AUTO, 1);
+    GenerateTxHdr351(gShimTxHdr, gShimTxFrm, n, gShimChannel, 0xC00F, AP_TX_ANT, 1);
     ApShimTxArm();
     DmaPublish();
     PostTxFrameAt(gShimTxBase, gShimTxRing.base, 0, gShimTxHdrPhys, (UInt16)TXH_SIZE_351, gShimTxFrmPhys, n);
@@ -5658,7 +5697,7 @@ static void ApShimRadioSoftOn(void)              /* b43_gphy_op_software_rfkill,
 static int ApShimTxGoodbye(void)
 {
     UInt16 dlen = BuildDeauth(gShimTxFrm, gShimMac, gShimTgtBssid);
-    GenerateTxHdr351(gShimTxHdr, gShimTxFrm, dlen, gShimChannel, 0xC00E, B43_TXH_PHY_ANT01AUTO, 1);
+    GenerateTxHdr351(gShimTxHdr, gShimTxFrm, dlen, gShimChannel, 0xC00E, AP_TX_ANT, 1);
     ApShimTxArm();
     DmaPublish();
     PostTxFrameAt(gShimTxBase, gShimTxRing.base, 0, gShimTxHdrPhys, (UInt16)TXH_SIZE_351, gShimTxFrmPhys, dlen);
@@ -5817,6 +5856,25 @@ static void ApLinkHeartbeat(UInt32 now)
     PCat(L, "ms body<="); PCatDec(L, (unsigned long)(gLinkBodyMaxUs / 1000u));
     PCat(L, "ms  ring "); PCatDec(L, (unsigned long)(ApRingCount() * 100u / AP_RING_LINES)); PCat(L, "%");
     Out(L);
+    /* k230: ARF rate-state readout (logging only; reads at task level are fine for a log). Confirms the
+     * throughput diagnosis -- if idx is pinned at 0 (CCK 1) with down>0 and the OFDM rates show 0 acked /
+     * N failed, the ARF cascaded to the 802.11b floor because OFDM-TX is never acked (the rev-8 tx_magn /
+     * OFDM-TX-quality signature). Per rate: <Mbps>:<acked>a/<never-acked>f. */
+    { UInt32 ri = gTxRateIdx; int ratei;
+      if(ri >= AP_TX_NRATES) ri = AP_TX_NRATES - 1;
+      L[0] = 0; PCat(L, "  [rate] idx "); PCatDec(L, (unsigned long)ri);
+      PCat(L, " = "); PCatDec(L, (unsigned long)kTxRates[ri].mbps);
+      PCat(L, kTxRates[ri].ofdm ? " Mbps OFDM" : " Mbps CCK");
+      PCat(L, "  up "); PCatDec(L, (unsigned long)gTxRateUp);
+      PCat(L, " down "); PCatDec(L, (unsigned long)gTxRateDown);
+      PCat(L, "  |");
+      for(ratei = 0; ratei < AP_TX_NRATES; ratei++){
+          PCat(L, " "); PCatDec(L, (unsigned long)kTxRates[ratei].mbps); PCat(L, ":");
+          PCatDec(L, (unsigned long)(gTxRateOk1[ratei] + gTxRateRetryOk[ratei])); PCat(L, "a/");
+          PCatDec(L, (unsigned long)gTxRateFail[ratei]); PCat(L, "f");
+      }
+      Out(L);
+    }
     gLinkHbBcn = bcn; gLinkHbRx = rx; gLinkHbTx = tx; gLinkLastHbTick = now;
 }
 

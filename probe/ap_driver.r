@@ -12,13 +12,17 @@
                                 * listed in the DEPENDS of the Rez command in CMakeLists. */
 
 resource 'vers' (1, locked) {
-    0x01, 0x99, beta, 219, verUS,
-    "1.0b219",
-    "AirPort Extreme 1.0b219 (k219 -- CLEARER NAME, AND WORKS ON MORE MACS. The network port now appears as "
-    "AirPort Extreme in the TCP/IP control panel's Connect via menu, so it is clear which driver is in use. The "
-    "driver also lets the card choose its antenna automatically instead of a setting fixed for the Power Mac G4 "
-    "MDD, so Macs that wire the card's antennas differently can still receive, and it confirms the card is a "
-    "Broadcom BCM4306 before using it. Restart normally.) "
+    0x01, 0x99, beta, 235, verUS,
+    "1.0b235",
+    "AirPort Extreme 1.0b235 (SUPPORTS A SECOND CARD, AND FINDS MORE NETWORKS. This release adds the "
+    "Broadcom BCM4318 -- the single-chip 802.11g card on many later Linksys adapters (PCI 14e4:4318) -- "
+    "alongside the BCM4306 it already supported, and it runs at full 802.11g speed on the BCM4318. It also "
+    "now scans 2.4 GHz channels 1-13 (was 1-11), so a base station on channel 12 or 13 is found. The "
+    "BCM4306 works exactly as in 1.0b219 apart from those two added scan channels. Restart normally.) "
+    "(k219 was: CLEARER NAME, AND WORKS ON MORE MACS. The network port appears as AirPort Extreme in the "
+    "TCP/IP control panel's Connect via menu, so it is clear which driver is in use. The driver also lets "
+    "the card choose its antenna automatically instead of a setting fixed for the Power Mac G4 MDD, so Macs "
+    "that wire the card's antennas differently can still receive.) "
     "(k217 was: OPEN NETWORKS. The driver now joins open (unencrypted) networks as well "
     "as WPA2 Personal: no password is asked, the four-way handshake is skipped, and data is sent in the clear. "
     "Choose an open network from the panel or the Control Strip the same way you choose a secured one. Restart "
@@ -169,7 +173,7 @@ resource 'vers' (1, locked) {
 };
 
 resource 'vers' (2, locked) {
-    0x01, 0x99, beta, 219, verUS,
-    "1.0b219",
-    "AirPort Extreme 1.0b219 (k219: shows as AirPort Extreme in TCP/IP; auto antenna; BCM4306 check)"
+    0x01, 0x99, beta, 235, verUS,
+    "1.0b235",
+    "AirPort Extreme 1.0b235 (adds the Broadcom BCM4318 single-chip 802.11g card (PCI 14e4:4318) at full 802.11g speed, alongside the BCM4306; scans 2.4 GHz channels 1-13 so an AP on 12/13 is found)"
 };

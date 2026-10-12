@@ -298,6 +298,11 @@ static UInt32 gFtCount=0;
  * changed and the transmission did not happen. */
 static int gTxLoop1=-1,gTxLoop2=-1,gTxLoop3=-1;
 static UInt16 gRadioPctlReg=0;
+/* k231: lo->tx_magn / lo->tx_bias. b43 inits tx_magn=0, tx_bias=0xFF; the rev-8 feedthrough
+ * search in LoMeasureTxctlValues overwrites them, and set_txpower_g / the initg tail consume them.
+ * They persist across calls exactly as b43's lo_control fields do (the search does not reset them). */
+static UInt16 gLoTxMagn=0;
+static UInt16 gLoTxBias=0xFFU;
 static int gTxA1=-1,gTxA2=-1,gTxA3=-1,gTxB1=-1,gTxB2=-1,gTxB3=-1;
 static UInt16 gTxAStat=0,gTxBStat=0;
 static UInt16 gTxBase=0,gTxTrig=0,gTxIfsTrig=0,gTxFinal=0,gTxIfsFinal=0;
@@ -414,19 +419,20 @@ static void DummyTransmission(int legacyVariant)
   TxStat("after the three waits           ");
 }
 
-/* ---- lo_measure_txctl_values. Much smaller on this card than the line count suggests, and the
- * reason is worth stating: the entire tx_magn/tx_bias search -- including every call to
+/* ---- lo_measure_txctl_values. The tx_magn/tx_bias search -- including every call to
  * lo_measure_feedthrough -- lives inside `if (has_tx_magnification(phy))`, which requires
- * radio_rev == 8. This radio is rev 2, so that whole loop is unreachable and the else arm is
- * three statements. lo_measure_feedthrough is therefore NOT part of this increment at all.
+ * radio_rev == 8. k231 ports that search for the rev-8 4318 (gShimRadioRev == 8); the rev-2 4306
+ * still takes the three-statement else arm, where lo_measure_feedthrough is never called.
  *
- * radio_pctl_reg comes out of an integer chain worth checking rather than trusting:
- *   has_loopback_gain = (rev > 1) || gmode -> TRUE (rev 2)
+ * radio_pctl_reg comes out of an integer chain worth checking rather than trusting. It is 3 for
+ * BOTH revs at this phase because max_lb_gain is 0, so the shared computation below is kept as-is:
+ *   has_loopback_gain = (rev > 1) || gmode -> TRUE
  *   lb_gain = gphy->max_lb_gain / 2 = 0, because b43_calc_loopback_gain runs LATER in initg
- *   lb_gain > 10 ? no -> cmp_val = 0x24 (rev>=2 && radio_rev==8 would make it 0x3C; not us)
- *   tmp = lb_gain = 0; (10 - 0) < 36 so tmp = 10; tmp >= 0 so tmp += 3 -> 13
- *   cmp_val /= 4 -> 9 ; tmp /= 4 -> 3 ; 3 >= 9 ? no -> radio_pctl_reg = 3
+ *   lb_gain > 10 ? no -> cmp_val = 0x24 (rev 8 would make it 0x3C; result is still 3 -- see k231 report)
+ *   tmp = lb_gain = 0; (10 - 0) < cmp_val so tmp = 10; tmp >= 0 so tmp += 3 -> 13
+ *   cmp_val /= 4 ; tmp /= 4 -> 3 ; 3 >= cmp_val/4 ? no -> radio_pctl_reg = 3
  * ---- */
+static UInt16 LoMeasureFeedthrough(UInt16 lna,UInt16 pga,UInt16 trsw);  /* defined below; the k231 rev-8 search calls it */
 static UInt16 LoMeasureTxctlValues(void)
 {
   UInt16 radio_pctl_reg,lbGain,tmp,cmpVal;
@@ -447,11 +453,32 @@ static UInt16 LoMeasureTxctlValues(void)
   RadioMaskSet(0x0043,0xFFF0,radio_pctl_reg);
   PhyMaskSet((UInt16)B43_PHY_DACCTL,0xFFC3,(UInt16)(2<<2));   /* set_baseband_attenuation(2) */
 
-  /* lo_txctl_register_table: G-PHY and radio_rev != 8 -> reg 0x52, value 0x30 */
-  RadioMaskSet(0x0052,(UInt16)~0x0030,0);                     /* b43_radio_mask(reg, ~mask) */
+  if(gShimRadioRev==8U){
+    /* ---- k231: rev-8 (radio rev 8) path. has_tx_magnification is TRUE, so b43 MEASURES
+     * tx_magn/tx_bias by minimising LO feedthrough (lo.c:219-250) instead of hardcoding them.
+     * lo_txctl_register_table for rev 8 returns reg 0x43, value 0x10 -> radio_mask(0x43, ~0x10).
+     * radio_pctl_reg came out 3 above exactly as it does for rev 2 (cmpVal 0x3C vs 0x24 does not
+     * change the result while max_lb_gain is 0), so the 0x43 low nibble is already set.
+     *   pre-search gains: has_loopback_gain TRUE, lb_gain 0 -> pga 0, trsw_rx 0, so the
+     *   feedthrough probe is LoMeasureFeedthrough(0,0,0). ---- */
+    /* ---- k232: the feedthrough SEARCH is REMOVED. k231 ran it fine and measured magn=0x70 /
+     * bias=0x00, but porting the whole LO/loopback-gain cluster regressed RX -- the loopback-gain
+     * step fed a changed gMaxLbGain into the RX gain and the scan went deaf. So this build SETS the
+     * k231-measured optimum as a FIXED value (no LoMeasureFeedthrough calls) and does ONLY the rev-8
+     * lo_txctl_register_table (radio 0x43, value 0x10). radio 0x52 is set by the stmt-4 apply + the
+     * clobber-fix sites (which survive the setup/restore 0x52 skip), so the fixed value sticks. The
+     * globals are left at 0/0xFF until here, so the pre-search stmt-4 writes 0 and ORACLE D passes. ---- */
+    gLoTxMagn=0x0070U; gLoTxBias=0x0000U;                     /* k231-measured optimum, applied FIXED */
+    RadioMaskSet(0x0043,(UInt16)~0x0010,0);                   /* b43_radio_mask(0x43, ~value) */
+    { Str255 L;L[0]=0;PCat(L,"    [k232] rev-8 tx_magn/tx_bias FIXED (no search): magn=0x");
+      PCatHex(L,gLoTxMagn,2);PCat(L," bias=0x");PCatHex(L,gLoTxBias,2);Out(L); }
+  } else {
+    /* lo_txctl_register_table: G-PHY and radio_rev != 8 -> reg 0x52, value 0x30 */
+    RadioMaskSet(0x0052,(UInt16)~0x0030,0);                   /* b43_radio_mask(reg, ~mask) */
 
-  /* has_tx_magnification FALSE -> the three-statement else arm */
-  RadioMaskSet(0x0052,0xFFF0,0);                              /* tx_bias = 0 */
+    /* has_tx_magnification FALSE -> the three-statement else arm */
+    RadioMaskSet(0x0052,0xFFF0,0);                            /* tx_bias = 0 */
+  }
   return radio_pctl_reg;
 }
 
@@ -719,7 +746,11 @@ static void CalcLoopbackGain(void)
   PhyMaskSet((UInt16)B43_PHY_ANALOGOVERVAL,0xFFFB,0);
   PhyMaskSet((UInt16)B43_PHY_CCK(0x03),0xFF9F,0x0040);
 
-  /* radio_rev != 8 */
+  /* k232: REVERTED to the rev-2 loopback-gain path. k231's rev-8 arm here (plus loopIMax 15 below)
+   * changed gMaxLbGain, which feeds the RX gain (LoCalibrateMiddle -> LoMeasureGainValues) and made
+   * the scan go deaf. The loopback-gain measurement does NOT affect the final radio 0x52 (tx_magn),
+   * so running the rev-2 path here keeps RX EXACTLY as the working k230 while the fixed tx_magn still
+   * applies. (radio 0x52 is saved as bradio[0] and restored below, so this is net-neutral on it.) */
   RadioWrite(0x0052,0);
   RadioMaskSet(0x0043,0xFFF0,0x0009);
   SetBasebandAtt(11);
@@ -738,7 +769,7 @@ static void CalcLoopbackGain(void)
    * outer loop as `for(i=0; i<max && !broke; i++)` is NOT equivalent: the i++ runs before the
    * condition is re-tested, so i ends one too high and max_lb_gain comes out 4 low -- silently.
    * `break` from the outer body reproduces the goto exactly, because break skips the increment. */
-  j=0; loopIMax=9;                                     /* radio_rev != 8 */
+  j=0; loopIMax=9;                                     /* k232: reverted to rev-2 (9); k231's rev-8 15 changed gMaxLbGain and deafened RX */
   for(i=0;i<loopIMax;i++){
     for(j=0;j<16;j++){
       RadioWrite(0x0043,i);
@@ -1093,8 +1124,10 @@ static void LoMeasureSetupPrefix(LoSaved *sav)
   sav->phy_syncctl  = PhyRead((UInt16)B43_PHY_SYNCCTL);
   sav->phy_dacctl   = PhyRead((UInt16)B43_PHY_DACCTL);
 
-  /* !has_tx_magnification -> save radio 0x52, masked to 0x00F0 by b43 itself */
-  sav->radio_52 = (UInt16)(RadioRead(0x0052) & 0x00F0);
+  /* k231: b43 saves radio 0x52 ONLY in the !has_tx_magnification arm (lo.c:433-436). rev 8 has
+   * tx magnification, so it does NOT save it here -- the measured value must survive the round trip. */
+  if(gShimRadioRev!=8U)
+    sav->radio_52 = (UInt16)(RadioRead(0x0052) & 0x00F0);  /* masked to 0x00F0 by b43 itself */
 
   /* not B-PHY -> the else arm */
   ssb_w16(gBus.bar0,B43_MMIO_3E2,(UInt16)(ssb_r16(gBus.bar0,B43_MMIO_3E2)|0x8000));
@@ -1162,7 +1195,8 @@ static void LoMeasureRestore(LoSaved *sav)
   PhyWrite((UInt16)B43_PHY_DACCTL,sav->phy_dacctl);
   RadioWrite(0x0043,sav->radio_43);
   RadioWrite(0x007A,sav->radio_7A);
-  RadioMaskSet(0x0052,0xFF0F,sav->radio_52);   /* !has_tx_magnification */
+  if(gShimRadioRev!=8U)
+    RadioMaskSet(0x0052,0xFF0F,sav->radio_52); /* !has_tx_magnification; rev 8 keeps the measured value (k231) */
   ssb_w16(gBus.bar0,B43_MMIO_3E2,sav->reg_3E2);
   /* B-PHY block: not run */
   PhyWrite((UInt16)B43_PHY_ANALOGOVER,sav->phy_analogover);
@@ -1201,7 +1235,13 @@ static int LoCalibrateMiddle(void)
 {
   int maxRxGain;
   RadioMaskSet(0x0043,0xFFF0,(UInt16)(rfAttG&0x000F));
-  RadioMaskSet(0x0052,(UInt16)~0x0030,0);        /* with_padmix FALSE -> set 0 */
+  /* b43_calibrate_lo_setting: radio_maskset(txctl_reg, ~txctl_value, with_padmix?..:0), lo.c:745.
+   * with_padmix is FALSE here. k231: rev 8 -> txctl_reg 0x43 / value 0x10 (NOT 0x52), so radio 0x52
+   * is untouched and the measured tx_magn/tx_bias survives this calibration. */
+  if(gShimRadioRev==8U)
+    RadioMaskSet(0x0043,(UInt16)~0x0010,0);      /* rev-8 txctl_reg 0x43 / value 0x10 */
+  else
+    RadioMaskSet(0x0052,(UInt16)~0x0030,0);      /* rev-2 txctl_reg 0x52 / value 0x30, set 0 */
   maxRxGain=(int)(rfAttG*2)+(int)(bbAttG/2);     /* padmix false, so no subtraction */
   maxRxGain+=(int)gMaxLbGain;                    /* has_loopback_gain TRUE */
   LoMeasureGainValues(maxRxGain,1);
@@ -1431,9 +1471,19 @@ static void SetTxpowerG(UInt16 bb,UInt16 rf,UInt8 txctl)
   bbAttG=bb; rfAttG=rf;                          /* b43 stores these into gphy */
   SetBasebandAtt(bb);                            /* stmt 1 */
   ShmWrite16Shared(B43_SHM_SH_RFATT,rf);         /* stmt 2 */
-  RadioMaskSet(0x0043,0xFFF0,(UInt16)(rf&0x000F));            /* stmt 3, radio_rev != 8 */
-  RadioMaskSet(0x0052,(UInt16)~0x0070,(UInt16)(txctl&0x0070));
-  RadioMaskSet(0x0052,0xFFF0,0);                 /* stmt 4, !has_tx_magnification, tx_bias 0 */
+  if(gShimRadioRev==8U){
+    /* k231: stmt 3 rev-8 (radio_ver 0x2050 && radio_rev 8) -- one write to radio 0x43 (b43 phy_g.c:237-238) */
+    RadioWrite(0x0043,(UInt16)((rf&0x000F)|(txctl&0x0070)));
+  } else {
+    RadioMaskSet(0x0043,0xFFF0,(UInt16)(rf&0x000F));            /* stmt 3, radio_rev != 8 */
+    RadioMaskSet(0x0052,(UInt16)~0x0070,(UInt16)(txctl&0x0070));
+  }
+  if(gShimRadioRev==8U){
+    /* k231: stmt 4 rev-8 has_tx_magnification -- write the measured tx_magn|tx_bias (b43 phy_g.c:244) */
+    RadioWrite(0x0052,(UInt16)(gLoTxMagn|((gLoTxBias==0xFFU)?0:gLoTxBias)));
+  } else {
+    RadioMaskSet(0x0052,0xFFF0,0);               /* stmt 4, !has_tx_magnification, tx_bias 0 */
+  }
   LoGAdjust(NULL,&outer,&steps);                 /* stmt 5 -- the piece i2 could not reach */
 }
 
@@ -1503,6 +1553,28 @@ static int ApPhyInitG(void)
     UInt16 bbAtt=0,rfAtt=0,txRaw=0,txBias=0;
     UInt8  txCtl=0;
     int oracleA=0,oracleB=0,oracleC=0,oracleD=0,oracleE=0,oracleF=0,oracleG=0,oracleH=0,oracleI=0,oracleJ=0,oracleK=0,oracleL=0,oracleM=0,oracleN=0,oracleO=0;
+
+    /* k229: THREAD THE RADIO REVISION BEFORE initb6. Without this, gShimRadioRev is still 0 through
+     * initb6 (it is stored much later, at the set_txpower_g block ~line 1660), so initb6 takes the
+     * rev-2 trace path and never programs the 2050 REV-8 radio TX chain -- TX does not radiate
+     * (proven by the 2026-10-11 over-the-air capture: 661 beacons from the test AP heard, 0 frames from us).
+     * b43 reads radio_ver/radio_rev in b43_phy_versioning, which runs BEFORE b43_phy_init; this
+     * mirrors that. Idempotent: the set_txpower_g block below re-reads and re-stores the same value.
+     * Uses the MMIO RADIO_CONTROL/DATA path (selector 1) -- the proven-safe id read, exactly as the
+     * set_txpower_g block does -- NOT the radio-register accessor (which aborts before PHY 0x3E). */
+    { UInt32 idRaw229;
+      ssb_w16(gBus.bar0,B43_MMIO_RADIO_CONTROL,0x0001);
+      (void)ssb_r16(gBus.bar0,B43_MMIO_RADIO_CONTROL);
+      idRaw229=(UInt32)ssb_r16(gBus.bar0,B43_MMIO_RADIO_DATA_LOW);
+      ssb_w16(gBus.bar0,B43_MMIO_RADIO_CONTROL,0x0001);
+      (void)ssb_r16(gBus.bar0,B43_MMIO_RADIO_CONTROL);
+      idRaw229|=((UInt32)ssb_r16(gBus.bar0,B43_MMIO_RADIO_DATA_HIGH))<<16;
+      gShimRadioVer=(UInt16)((idRaw229&0x0FFFF000UL)>>12);
+      gShimRadioRev=(UInt16)((idRaw229&0xF0000000UL)>>28);
+      SayH("  [k229] radio rev threaded before initb6: ver = ",gShimRadioVer,4);
+      SayH("  [k229]   rev = ",gShimRadioRev,4);
+    }
+
     /* ================= b43_phy_initb6, from its first statement ================= */
     Say("");
     Say("=== b43_phy_initb6 (phy_g.c:1585) ===");
@@ -1525,8 +1597,38 @@ static int ApPhyInitG(void)
     RadioWrite(0x007A,(UInt16)(before7a|0x0058));
     SayH("  after stmt 1587          = ",(unsigned long)RadioRead(0x007A),4);
 
-    /* radio_rev 4/5, 6/7 and 8 blocks: NOT TAKEN on this card (rev 2). Not ported as dead
-     * branches -- the hardware that would enter them is not the hardware in the machine. */
+    /* radio_rev 4/5 and 6/7 blocks: NOT TAKEN (this family is rev 2 or rev 8; 4/5/6/7 are other
+     * silicon). The radio_rev == 8 block below IS now ported -- the BCM4318 in the FW400 is rev 8,
+     * and omitting it (as the original rev-2 trace did) left the rev-8 radio TX chain unprogrammed. */
+    /* k229: b43_phy_initb6 radio_rev == 8 block (phy_g.c:1603-1622). Programs the 2050 rev-8
+     * radio's TX/RX chain registers. These are PERSISTENT (initb6 does not save/restore them,
+     * unlike radio_init2050), so on rev 8 they are the operating config. gShimRadioRev was threaded
+     * at the top of this function, so the gate is valid here. */
+    if(gShimRadioRev==8U){
+      UInt16 bfl229=(UInt16)ssb_r16(gBus.bar0,SSB_SPROM_BASE1+SPROM_BFLLO);
+      Say("");
+      Say("  [k229] radio_rev == 8 block: program the rev-8 2050 TX/RX chain (phy_g.c:1603-1622)");
+      RadioWrite(0x0051,0x0000);
+      RadioWrite(0x0052,0x0040);
+      RadioWrite(0x0053,0x00B7);
+      RadioWrite(0x0054,0x0098);
+      RadioWrite(0x005A,0x0088);
+      RadioWrite(0x005B,0x006B);
+      RadioWrite(0x005C,0x000F);
+      if(bfl229 & 0x8000U){   /* B43_BFL_ALTIQ (0x8000); clear on our 0x6249 board -> the else arm */
+        RadioWrite(0x005D,0x00FA);
+        RadioWrite(0x005E,0x00D8);
+      } else {
+        RadioWrite(0x005D,0x00F5);
+        RadioWrite(0x005E,0x00B8);
+      }
+      RadioWrite(0x0073,0x0003);
+      RadioWrite(0x007D,0x00A8);
+      RadioWrite(0x007C,0x0001);
+      RadioWrite(0x007E,0x0008);
+      SayH("    board flags (SPROM 0x72) = ",bfl229,4);
+      Say("    rev-8 radio TX/RX chain programmed (0x51/0x52/0x53/0x54/0x5A/0x5B/0x5C/0x5D/0x5E/0x73/0x7D/0x7C/0x7E)");
+    }
 
     /* ---- the three PHY table loops ---- */
     Say("");
@@ -1581,11 +1683,14 @@ static int ApPhyInitG(void)
     RadioWrite(0x007C,(UInt16)(RadioRead(0x007C)|0x0002));
     SayH("       radio 0x7C read ok, now = ",(unsigned long)RadioRead(0x007C),4);
     RadioWrite(0x0050,0x0020);
-    /* radio_rev <= 2 -> taken */
-    RadioWrite(0x0050,0x0020);
-    RadioWrite(0x005A,0x0070);
-    RadioWrite(0x005B,0x007B);
-    RadioWrite(0x005C,0x00B0);
+    /* radio_rev <= 2 arm (b43 phy_g.c:1661-1666). k229: gated -- on rev 8 the radio_rev == 8 block
+     * above already set 0x5A=0x88/0x5B=0x6B/0x5C=0x0F, and these rev-2 values would clobber them. */
+    if(gShimRadioRev<=2U){
+      RadioWrite(0x0050,0x0020);
+      RadioWrite(0x005A,0x0070);
+      RadioWrite(0x005B,0x007B);
+      RadioWrite(0x005C,0x00B0);
+    }
     RadioMaskSet(0x007A,0x00F8,0x0007);
     GphyChannelSwitch(1,0);
     SayH("    CHANNEL_EXT after the dance = ",(unsigned long)ssb_r16(gBus.bar0,B43_MMIO_CHANNEL_EXT),4);
@@ -1606,13 +1711,13 @@ static int ApPhyInitG(void)
 
     /* ---- the scalar tail, up to but NOT including set_txpower_g ---- */
     Say("");
-    Say("  scalar writes (radio_rev < 6 -> PHY 0x2A = 0x8AC0, not 0x88C2)");
+    Say("  scalar writes (k229: radio_rev >= 6 -> PHY 0x2A = 0x88C2, else 0x8AC0)");
     PhyWrite(0x0014,0x0200);
-    PhyWrite(0x002A,0x8AC0);
+    PhyWrite(0x002A,(UInt16)((gShimRadioRev>=6U)?0x88C2U:0x8AC0U));
     PhyWrite(0x0038,0x0668);
     gBad=0;
     CheckPhy("scalar",0x0014,0x0200);
-    CheckPhy("scalar",0x002A,0x8AC0);
+    CheckPhy("scalar",0x002A,(UInt16)((gShimRadioRev>=6U)?0x88C2U:0x8AC0U));
     CheckPhy("scalar",0x0038,0x0668);
     if(!gBad){ oracleC=1; Say("    ==> ORACLE C PASSED."); }
     else Say("    ✗ ORACLE C FAILED.");
@@ -1640,23 +1745,48 @@ static int ApPhyInitG(void)
       SayH("  radio raw = ",raw,8);
       SayH("    manuf = ",rmanuf,4); SayH("    ver = ",rver,4); SayH("    rev = ",rrev,4);
 
+      /* Thread the radio identity to the bring-up decisions that key on the revision: the synth_pu
+       * workaround (ap_bringup.h) and the 4318 TSSI host flag (ApShimCoreInitMid). Stored BEFORE the
+       * master gate below so it runs for BOTH chips -- the 4306 (rev 2) stores and passes the gate;
+       * the 4318 (rev 6) stores and is then REFUSED by the gate (Pieces 1/2 unported), but the stored
+       * revision is what ApShimCoreInitMid (which runs afterwards) reads to set the 4318 flag. */
+      gShimRadioVer = rver;
+      gShimRadioRev = rrev;
+
       if(ExpMgrConfigReadLong(&gBus.node,(LogicalAddress)0x2C,&subsys)!=noErr) subsys=0;
       bvend=(UInt16)(subsys&0xFFFFUL); btype=(UInt16)((subsys>>16)&0xFFFFUL);
       SayH("  PCI 0x2C subsystem = ",subsys,8);
       SayH("    board vendor = ",bvend,4); SayH("    board type   = ",btype,4);
 
-      if(rmanuf!=0x017FU||rver!=0x2050U||rrev!=2U){
+      if(rmanuf!=0x017FU||rver!=0x2050U||(rrev!=2U && rrev!=8U)){
         Say("  !! NOT the part these derivations were reasoned about (expected Broadcom 0x17F,");
-        Say("     radio 0x2050 rev 2). REFUSING rather than applying an attenuation derived for");
-        Say("     different silicon -- a wrong attenuation does not fault, it mis-tunes.");
+        Say("     radio 0x2050 rev 2 or rev 8). REFUSING rather than applying an attenuation derived");
+        Say("     for different silicon -- a wrong attenuation does not fault, it mis-tunes.");
         goto initg_done; }
+      if(rrev==8U){
+        /* k224 Piece-2 DOWNSTREAM PROBE: a rev-8 BCM4318. set_txpower_g's rev-8 arms are right
+         * (DefaultBasebandAtt=2, DefaultTxControlRaw=TXMIX), but DefaultRadioAtt below is still the
+         * rev-2 derivation, and the downstream PHY arms (init_pctl, calc_nrssi_slope, lo_measure)
+         * are not rev-8 ported. We CONTINUE anyway -- a wrong attenuation mis-tunes, it does not
+         * fault -- to measure HOW FAR bring-up gets and where it NEXT stops, so the following
+         * increment ports exactly what this hardware needs. This is NOT a tuned 4318 bring-up. */
+        Say("  \xE2\x98\x85 radio 0x2050 REV 8 (BCM4318) ACCEPTED -- k224 Piece-2 downstream probe.");
+        Say("     Continuing past set_txpower_g with rev-8 defaults (rfatt is still the rev-2 value)");
+        Say("     to find where the rev-8 path next stops. NOT yet a tuned 4318 bring-up.");
+      }
 
       /* b43_gphy_op_prepare_hardware's three defaults, derived not transcribed. */
       bbAtt = DefaultBasebandAtt(rver,rrev); bbAttG = bbAtt;
       /* boardRev is passed 0: it is read from SPROM in b43 and gates ONLY the BCM4309G arm,
        * which additionally requires boardVendor == 0x14E4. This card reports 0x106B (Apple),
        * so that arm is unreachable here and the value cannot change the result. */
-      rfAtt = DefaultRadioAtt_2050rev2_G(gBus.chipId,bvend,btype,0); rfAttG = rfAtt;
+      /* b43 default_radio_attenuation: radio_rev 8 (the 4318) uses att=10 (0xA), with_padmix=true
+       * (the padmix arrives via tx_control's TXMIX bit, exactly as b43 derives it). Every other rev
+       * takes the measured rev-2 derivation. k226: this corrects the rev-2 rfatt that left the 4318's
+       * TX unheard in k225 (the frame transmitted, retried 7x, and was NEVER acked). */
+      if(rrev==8U) rfAtt = 0x000AU;
+      else         rfAtt = DefaultRadioAtt_2050rev2_G(gBus.chipId,bvend,btype,0);
+      rfAttG = rfAtt;
       txRaw = DefaultTxControlRaw(rver,rrev);
       txCtl = (UInt8)(txRaw<<4);      /* ⚠⚠ see the note below -- this truncates */
 
@@ -1693,22 +1823,40 @@ static int ApPhyInitG(void)
     Say("  stmt 2: SHM_SHARED[0x0064] = rfatt");
     ShmWrite16Shared(B43_SHM_SH_RFATT,rfAtt);
 
-    /* stmt 3 -- radio_ver == 0x2050 && radio_rev == 8 ? no (rev 2) -> the else arm */
-    Say("  stmt 3: radio_rev != 8, so the two-maskset arm");
-    Say("    ⚠ FIRST TOUCH of radio 0x43 and 0x52, and both are read-modify-WRITES, so both");
-    Say("      READ first. A read is what master-aborts, and 0x7A needed PHY 0x003E before it");
-    Say("      would answer. Each is logged before it happens so an abort names the register.");
-    Say("    -> about to READ radio 0x43 (first ever)");
-    RadioMaskSet(0x0043,0xFFF0,(UInt16)(rfAtt&0x000F));
-    SayH("       radio 0x43 ok, now = ",(unsigned long)RadioRead(0x0043),4);
-    Say("    -> about to READ radio 0x52 (first ever)");
-    RadioMaskSet(0x0052,(UInt16)~0x0070,(UInt16)(txCtl&0x0070));
-    SayH("       radio 0x52 ok, now = ",(unsigned long)RadioRead(0x0052),4);
+    /* stmt 3 -- radio_ver == 0x2050 && radio_rev == 8 ? the rev-8 arm is a SINGLE write to radio
+     * 0x43 combining the rfatt nibble and the tx_control bits; the else (rev != 8) arm is the two
+     * masksets (0x43 then 0x52). k226 ports the rev-8 arm for the 4318. */
+    if(gShimRadioRev==8U){
+      Say("  stmt 3: radio_rev == 8 -> single write radio 0x43 = (rfatt & 0x0F) | (tx_control & 0x70)");
+      RadioWrite(0x0043,(UInt16)((rfAtt&0x000F)|(txCtl&0x0070)));
+      SayH("       radio 0x43 now = ",(unsigned long)RadioRead(0x0043),4);
+    } else {
+      Say("  stmt 3: radio_rev != 8, so the two-maskset arm");
+      Say("    ⚠ FIRST TOUCH of radio 0x43 and 0x52, and both are read-modify-WRITES, so both");
+      Say("      READ first. A read is what master-aborts, and 0x7A needed PHY 0x003E before it");
+      Say("      would answer. Each is logged before it happens so an abort names the register.");
+      Say("    -> about to READ radio 0x43 (first ever)");
+      RadioMaskSet(0x0043,0xFFF0,(UInt16)(rfAtt&0x000F));
+      SayH("       radio 0x43 ok, now = ",(unsigned long)RadioRead(0x0043),4);
+      Say("    -> about to READ radio 0x52 (first ever)");
+      RadioMaskSet(0x0052,(UInt16)~0x0070,(UInt16)(txCtl&0x0070));
+      SayH("       radio 0x52 ok, now = ",(unsigned long)RadioRead(0x0052),4);
+    }
 
-    /* stmt 4 -- has_tx_magnification = (rev>=2 && radio_ver==0x2050 && radio_rev==8): FALSE
-     * for us, because radio_rev is 2, so the maskset arm rather than the direct write. */
-    Say("  stmt 4: has_tx_magnification is FALSE (needs radio_rev == 8), so maskset(0x52,0xFFF0)");
-    RadioMaskSet(0x0052,0xFFF0,(UInt16)(txBias&0x000F));
+    /* stmt 4 -- has_tx_magnification = (rev>=2 && radio_ver==0x2050 && radio_rev==8). For the rev-8
+     * 4318 it is TRUE: a direct write radio 0x52 = tx_magn | tx_bias. Otherwise the maskset. tx_magn
+     * is 0 until lo_measure_txctl_values runs (in lo_g_adjust, next), matching b43's first
+     * set_txpower_g call; a later recalc writes the measured value. k226 ports the rev-8 arm. */
+    if(gShimRadioRev==8U){
+      UInt16 txMagn=gLoTxMagn;                                     /* k231: lo->tx_magn (measured) */
+      UInt16 txBiasReg=(UInt16)((gLoTxBias==0xFFU)?0:gLoTxBias);   /* lo->tx_bias, 0xFF folds to 0 */
+      Say("  stmt 4: has_tx_magnification TRUE (radio_rev 8) -> write radio 0x52 = tx_magn | tx_bias");
+      RadioWrite(0x0052,(UInt16)(txMagn|txBiasReg));
+      SayH("       radio 0x52 now = ",(unsigned long)RadioRead(0x0052),4);
+    } else {
+      Say("  stmt 4: has_tx_magnification is FALSE (needs radio_rev == 8), so maskset(0x52,0xFFF0)");
+      RadioMaskSet(0x0052,0xFFF0,(UInt16)(txBias&0x000F));
+    }
 
     /* ---- ORACLE D: the values set_txpower_g leaves behind ---- */
     Say("");
@@ -1773,8 +1921,12 @@ static int ApPhyInitG(void)
       SayH("     saved CRS0        = ",sav.phy_crs0,4);
       SayH("     saved radio 0x43  = ",sav.radio_43,4);
       SayH("     saved radio 0x7A  = ",sav.radio_7A,4);
-      SayH("     saved radio 0x52  = ",sav.radio_52,4);
-      Say ("       (b43 masks this one to 0x00F0 as it saves it, so only bits 4-7 are carried.)");
+      if(gShimRadioRev==8U){
+        Say ("     radio 0x52 NOT saved (rev 8 has_tx_magnification -- the measured value is kept).");
+      } else {
+        SayH("     saved radio 0x52  = ",sav.radio_52,4);
+        Say ("       (b43 masks this one to 0x00F0 as it saves it, so only bits 4-7 are carried.)");
+      }
       SayH("     saved 0x3F4       = ",sav.reg_3F4,4);
       SayH("     saved 0x3E2       = ",sav.reg_3E2,4);
       Say ("       ⚠ 0x3E2 is FIRST TOUCH -- never read on this card before this line.");
@@ -1930,12 +2082,18 @@ static int ApPhyInitG(void)
 
       /* ⚠ radio 0x52 is restored with maskset(0x52, 0xFF0F, sav.radio_52), and sav.radio_52 was
        * itself masked to 0x00F0 on the way in. So ONLY bits 4-7 are carried, and only those may
-       * be compared. Demanding the whole word would fail for a correct port. */
-      got=(UInt16)(RadioRead(0x0052)&0x00F0);
-      { Str255 L;L[0]=0;PCat(L,"      radio 0x52 &0xF0  want 0x");PCatHex(L,sav.radio_52,4);
-        PCat(L,"  got 0x");PCatHex(L,got,4);
-        PCat(L,(got==sav.radio_52)?"  ok":"  ✗ MISMATCH");Out(L); }
-      if(got!=sav.radio_52) gBad++;
+       * be compared. Demanding the whole word would fail for a correct port.
+       * k231: rev 8 (has_tx_magnification) neither saves nor restores radio 0x52 -- it KEEPS the
+       * measured value by design -- so sav.radio_52 holds nothing and the round trip is skipped. */
+      if(gShimRadioRev==8U){
+        Say("      radio 0x52 -- not saved/restored on rev 8 (measured value retained), check skipped.");
+      } else {
+        got=(UInt16)(RadioRead(0x0052)&0x00F0);
+        { Str255 L;L[0]=0;PCat(L,"      radio 0x52 &0xF0  want 0x");PCatHex(L,sav.radio_52,4);
+          PCat(L,"  got 0x");PCatHex(L,got,4);
+          PCat(L,(got==sav.radio_52)?"  ok":"  ✗ MISMATCH");Out(L); }
+        if(got!=sav.radio_52) gBad++;
+      }
 
       got=ssb_r16(gBus.bar0,B43_MMIO_3E2);
       { Str255 L;L[0]=0;PCat(L,"      MMIO 0x3E2    want 0x");PCatHex(L,sav.reg_3E2,4);
@@ -2054,8 +2212,12 @@ static int ApPhyInitG(void)
     Say("    PHY type == G         YES -> b43_write16(0x03E6, 0x0)");
     { UInt16 p2Before,p2After,p3e6;
       Say("");
-      Say("  -> radio 0x5D = 0x000D");
-      RadioWrite(0x005D,0x000D);
+      /* k229: radio 0x5D=0x000D is b43's radio_rev<=2 arm (phy_g.c:1680-1681). SKIP on rev 8,
+       * where the radio_rev == 8 block already set 0x5D=0xF5 and 0x000D would clobber it. */
+      if(gShimRadioRev<=2U){
+        Say("  -> radio 0x5D = 0x000D");
+        RadioWrite(0x005D,0x000D);
+      } else { Say("  -> radio 0x5D = 0x000D SKIPPED (rev 8 keeps the rev-8 block's 0x5D)"); }
       Say("     ⚠ NOT VERIFIED BY READBACK, AND THAT IS DELIBERATE. b43 NEVER READS radio 0x5D:");
       Say("       five write sites across phy_g.c, no read, no mask/maskset/set anywhere. So a");
       Say("       readback here would be an access the reference never performs -- the exact");
@@ -2318,7 +2480,16 @@ static int ApPhyInitG(void)
         else Say("      != 5 -> the OFDM(0xCC) maskset is NOT run"); }
       Say("    (rev <= 2 && gmode) || rev >= 2 -> OFDM(0x7E) = 0x0078");
       PhyWrite((UInt16)B43_PHY_OFDM(0x7E),0x0078);
-      Say("    radio_rev == 8 -> NOT run (this radio is rev 2)");
+      if(gShimRadioRev==8U){
+        Say("    [k233] radio_rev == 8 -> EXTG(0x01) |= 0x0080, OFDM(0x3E) |= 0x0004  (phy_g.c:2036-2039)");
+        PhySet((UInt16)B43_PHY_EXTG(0x01),0x0080);
+        PhySet((UInt16)B43_PHY_OFDM(0x3E),0x0004);
+        { UInt16 e1=PhyRead((UInt16)B43_PHY_EXTG(0x01)),o3=PhyRead((UInt16)B43_PHY_OFDM(0x3E));
+          Str255 L;L[0]=0;PCat(L,"      readback EXTG(0x01)=0x");PCatHex(L,e1,4);
+          PCat(L,(e1&0x0080)?" (0x80 set)":" ✗ 0x80 NOT set");
+          PCat(L,"  OFDM(0x3E)=0x");PCatHex(L,o3,4);
+          PCat(L,(o3&0x0004)?" (0x04 set)":" ✗ 0x04 NOT set");Out(L); }
+      } else Say("    radio_rev == 8 -> NOT run (this radio is not rev 8)");
 
       Say("");
       Say("  -> has_loopback_gain is TRUE -> b43_calc_loopback_gain(dev)");
@@ -2471,10 +2642,19 @@ static int ApPhyInitG(void)
       Say("       b43_gphy_op_supports_hwpctl returns (phy->rev >= 6). This PHY is rev 2, so the");
       Say("       guard is false no matter what the module parameter says -- exactly as it was");
       Say("       for the hwpctl blocks in lo_measure_setup and lo_measure_restore. Nothing runs.");
-      Say("  -> has_tx_magnification is FALSE -> radio_maskset(0x52, 0xFFF0, lo->tx_bias)");
-      Say1("     lo->tx_bias = ",(unsigned long)0);
-      Say("     (set to 0 by lo_measure_txctl_values' else arm back in 4b-ii-5b)");
-      RadioMaskSet(0x0052,0xFFF0,0);
+      /* k231: b43_phy_initg's tail commits the LO tx state into radio 0x52 (phy_g.c:2050-2057).
+       * rev 8 has_tx_magnification TRUE -> write (0x52 & 0xFF00) | tx_bias | tx_magn (the measured
+       * pair), NOT the rev-2 maskset below -- otherwise the measured tx_bias would be cleared. */
+      if(gShimRadioRev==8U){
+        Say("  -> has_tx_magnification is TRUE -> radio 0x52 = (0x52 & 0xFF00) | tx_bias | tx_magn");
+        RadioWrite(0x0052,(UInt16)((RadioRead(0x0052)&0xFF00)|gLoTxBias|gLoTxMagn));
+        SayH("     radio 0x52 now = ",(unsigned long)RadioRead(0x0052),4);
+      } else {
+        Say("  -> has_tx_magnification is FALSE -> radio_maskset(0x52, 0xFFF0, lo->tx_bias)");
+        Say1("     lo->tx_bias = ",(unsigned long)0);
+        Say("     (set to 0 by lo_measure_txctl_values' else arm back in 4b-ii-5b)");
+        RadioMaskSet(0x0052,0xFFF0,0);
+      }
       Say("  -> rev >= 6 -> NOT run (no CCK(0x36) maskset)");
       Say("  -> boardflags & PACTRL is SET -> CCK(0x2E) = 0x8075  (not 0x807F)");
       PhyWrite((UInt16)B43_PHY_CCK(0x2E),0x8075);
@@ -2607,7 +2787,13 @@ static int ApPhyInitG(void)
       /* ============ initg's last statements: init_pctl and the chip_pkg tail ============ */
       Say("");
       Say("=== b43_phy_init_pctl and initg's final branch -- 4b-ii-9b ===");
-      Say("  -> radio_rev == 8 -> EXTG(0x05) = 0x3230   NOT run (this radio is rev 2)");
+      if(gShimRadioRev==8U){
+        Say("  [k233] radio_rev == 8 -> EXTG(0x05) = 0x3230  (phy_g.c:2090-2091)");
+        PhyWrite((UInt16)B43_PHY_EXTG(0x05),0x3230);
+        { UInt16 e5=PhyRead((UInt16)B43_PHY_EXTG(0x05));
+          Str255 L;L[0]=0;PCat(L,"      readback EXTG(0x05)=0x");PCatHex(L,e5,4);
+          PCat(L,(e5==0x3230)?" ok":" ✗ MISMATCH");Out(L); }
+      } else Say("  -> radio_rev == 8 -> EXTG(0x05) = 0x3230   NOT run (this radio is not rev 8)");
       Say("  -> b43_phy_init_pctl(dev)");
       Say("     board vendor is 0x106B (Apple), not BCM, so the BU4306 early return does not");
       Say("     fire. gmode is TRUE. cur_idle_tssi is 0 from prepare_structs, so the measurement");

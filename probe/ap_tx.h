@@ -169,6 +169,17 @@ static UInt32 gTxhShift = 0;           /* 0 for FW_HDR_351, 4 for FW_HDR_410 */
 #define B43_TXH_PHY_ANT_MASK   0x03C0
 #define B43_TXH_PHY_ANT0       0x0000
 #define B43_TXH_PHY_ANT1       0x0040
+
+/* ★ k228: the TX antenna, per chip. b43 asks for ANT01AUTO assuming two connected antennas; the
+ * 4306 (MDD A1026) works that way (k14: ANT0/ANT1/AUTO all identical). The 4318 (Linksys WMP54GS,
+ * FW400) does NOT: k225-k227 showed the frame transmits but is NEVER acked, no radio-power register
+ * (rfatt/tx_magn/tx_bias) changes it, and ap_tx.h's own note predicts exactly this -- TX auto-selects
+ * the UNCONNECTED antenna and radiates into an open circuit, while RX diversity settles on the
+ * connected one. The k225-k227 RX stats prove the connected antenna is ANT1 (every-frame 379/2195 on
+ * ant0/ant1). So force ANT1 for the 4318; leave every other chip on b43's default. gBus is in scope
+ * at every expansion site in ap_shim.c. (A general fix would derive this from the live RX-diversity
+ * tally rather than hardcode ANT1; this gets the 4318 on the air first.) */
+#define AP_TX_ANT   ((gBus.chipId == 0x4318UL) ? B43_TXH_PHY_ANT1 : B43_TXH_PHY_ANT01AUTO)
 #define B43_TXH_EFT_FB_CCK     0x00
 #define B43_CCK_RATE_1MB       0x02        /* units of 500 kbps; the PLCP formula confirms it */
 #define B43_CCK_RATECODE_1MB   0x0A

@@ -68,6 +68,11 @@
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wunused-function"
 
+/* The 4306-vs-4318 radio-revision predicates. Pure, host-tested (radiorev_test.c). Included inside
+ * the -Wunused-function suppression: Wants4318Tssi is used only from ap_shim.c, so other probes that
+ * take this header would otherwise warn on an unused static. */
+#include "ap_radiorev.h"
+
 #define B43_MMIO_MACCTL             0x120UL
 #define B43_MMIO_SHM_CONTROL        0x160UL
 #define B43_MMIO_SHM_DATA           0x164UL
@@ -146,6 +151,20 @@ static UInt16 gFwRev = 0;
  * previous run left it up and this is not a fresh boot. The best single predictor of a void
  * run that this project has found. */
 static int gCoreWasAlreadyUp = 0;
+
+/* The Broadcom B2050 radio's version and revision, read once during G-PHY init (ap_phy_initg.h, the
+ * ApPhyInitG path) from B43_MMIO_RADIO_DATA_{LOW,HIGH}. radio_ver is 0x2050 for every card in the
+ * endgame grid; radio_rev is the 4306-vs-4318 discriminator (4306 = rev 2, 4318 = rev 6) and gates
+ * two bring-up decisions -- the synth_pu workaround (SynthPuWorkaround, below) and the 4318 TSSI host
+ * flag (ApShimCoreInitMid, ap_shim.c). The pure predicates that read them are SynthPuShouldSkip /
+ * Wants4318Tssi in ap_radiorev.h. Defined HERE, not beside gShimCoreRev/gShimPhyRev in ap_shim.c:
+ * those sit below ap_shim.c's #includes and so are invisible to this header, whereas these two are
+ * consumed from this header, ap_phy_initg.h, and ap_shim.c alike -- one copy, one driver TU. They
+ * read 0 until the radio id has been read, which (see ap_radiorev.h's ⚠) is AFTER ApShimRadioOn in
+ * the current bring-up order -- so SynthPuWorkaround sees 0 and the guard below is, for now, inert on
+ * both chips; ApShimCoreInitMid runs later and does see the populated revision. */
+static UInt16 gShimRadioVer = 0;
+static UInt16 gShimRadioRev = 0;
 
 /* --- the four primitives, each exactly as b43 defines it ------------------- */
 
@@ -257,12 +276,15 @@ static void GpioInit(UInt32 *boardflagsOut,UInt32 *maskOut,UInt32 *setOut,int *c
 static const UInt8 kChanCodeBg[14]={12,17,22,27,32,37,42,47,52,57,62,67,72,84};
 static UInt16 Channel2FreqBg(UInt8 ch){return (UInt16)kChanCodeBg[ch-1];}
 
-/* b43_synth_pu_workaround: guarded by (radio_ver == 0x2050 && radio_rev < 6). Stage 4a read this
- * card as radio 0x2050 rev 2, so THE BRANCH IS TAKEN -- the guard is not reproduced as a runtime
- * test because the hardware that would fail it is not the hardware in the machine. Writes
- * B43_MMIO_CHANNEL only; it reads and writes no radio register. */
+/* b43_synth_pu_workaround: runs for (radio_ver == 0x2050 && radio_rev < 6). The 4306 reads radio
+ * 0x2050 rev 2, so it takes the branch; the 4318 (rev 6) must NOT. The guard IS now a runtime test
+ * -- SynthPuShouldSkip(), see ap_radiorev.h -- phrased to skip ONLY a positively-identified rev>=6
+ * radio, so that the identity being unread at this point in bring-up (ApShimRadioOn runs before the
+ * radio-id read; see ap_radiorev.h's ⚠) falls through to RUNNING the workaround, i.e. the 4306's
+ * shipped behavior, unchanged. Writes B43_MMIO_CHANNEL only; it reads and writes no radio register. */
 static void SynthPuWorkaround(UInt8 ch)
-{ if(ch<=10) ssb_w16(gBus.bar0,B43_MMIO_CHANNEL,Channel2FreqBg((UInt8)(ch+4)));
+{ if(SynthPuShouldSkip(gShimRadioVer,gShimRadioRev)) return;   /* 4318 (radio rev 6): b43 skips this */
+  if(ch<=10) ssb_w16(gBus.bar0,B43_MMIO_CHANNEL,Channel2FreqBg((UInt8)(ch+4)));
   else       ssb_w16(gBus.bar0,B43_MMIO_CHANNEL,Channel2FreqBg(1));
   SsbSpinUs(1000);                                  /* msleep(1) */
   ssb_w16(gBus.bar0,B43_MMIO_CHANNEL,Channel2FreqBg(ch)); }
