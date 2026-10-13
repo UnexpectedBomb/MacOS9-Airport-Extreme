@@ -102,6 +102,8 @@ COMPATIBLE 802.11g BCM4306/BCM4318 NETWORKING CARDS
 | Linksys | WPC54G v1.x | CardBus card | Unconfirmed |
 | Linksys | WPC54GS v1.1 | CardBus card | Yes |
 
+The unconfirmed cards SHOULD theoretically work but have yet to be tested.
+
 Reports of success or failure are very welcome: please say which Mac, which card and its PCI ID, and what
 happened.
 
