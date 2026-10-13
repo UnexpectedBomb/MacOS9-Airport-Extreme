@@ -65,19 +65,19 @@ confirmed. Every other row needs a community report to move from No to Yes.
 | Model | Model ID | Confirmed working |
 |---|---|---|
 | Power Mac G4 MDD FW800 | PowerMac3,6 | Yes |
-| eMac G4 1.25GHz (USB 2.0) | PowerMac6,4 | No |
-| eMac G4 1.42GHz (2005) | PowerMac6,4 | No |
-| iMac G4 15-inch 1.0GHz | PowerMac6,3 | No |
-| iMac G4 17/20-inch 1.25GHz | PowerMac6,3 | No |
-| Mac mini G4 (Early 2005) | PowerMac10,1 | No |
+| eMac G4 1.25GHz (USB 2.0) | PowerMac6,4 | Unconfirmed |
+| eMac G4 1.42GHz (2005) | PowerMac6,4 | Unconfirmed |
+| iMac G4 15-inch 1.0GHz | PowerMac6,3 | Unconfirmed |
+| iMac G4 17/20-inch 1.25GHz | PowerMac6,3 | Unconfirmed |
+| Mac mini G4 (Early 2005) | PowerMac10,1 | Unconfirmed |
 | iBook G4 (2004, Radeon 9200) | PowerBook6,5 | Yes |
-| iBook G4 (2003, Radeon 9200) | PowerBook6,3 | No |
-| Al PowerBook G4 12-inch 867MHz | PowerBook6,1 | No |
-| Al PowerBook G4 12-inch 1.0-1.5GHz | PowerBook6,2 / 6,4 / 6,8 | No |
-| Al PowerBook G4 17-inch 1.0GHz | PowerBook5,1 | No |
-| Al PowerBook G4 15/17-inch (Radeon) | PowerBook5,2-5,7 | No |
+| iBook G4 (2003, Radeon 9200) | PowerBook6,3 | Unconfirmed |
+| Al PowerBook G4 12-inch 867MHz | PowerBook6,1 | Unconfirmed |
+| Al PowerBook G4 12-inch 1.0-1.5GHz | PowerBook6,2 / 6,4 / 6,8 | Unconfirmed |
+| Al PowerBook G4 17-inch 1.0GHz | PowerBook5,1 | Unconfirmed |
+| Al PowerBook G4 15/17-inch (Radeon) | PowerBook5,2-5,7 | Unconfirmed |
 
-**Check your card.** The A1026 card shipped in two chip revisions, and **both are now driven**: early cards
+The A1026 card shipped in two chip revisions, and **both are now driven**: early cards
 are the **BCM4306** (`14e4:4320` or `14e4:4325`), later ones the **BCM4318** (`14e4:4318`). In Apple System
 Profiler any of those three PCI IDs is supported. BCM4318 support is new in this release and is confirmed on
 a BCM4318 **PCI** card (Linksys WMP54GS) at full 802.11g speed; the A1126/A1127 combo cards built into later
