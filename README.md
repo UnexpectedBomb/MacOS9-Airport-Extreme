@@ -69,7 +69,7 @@ AIRPORT EXTREME (A1026) COMPATIBLE G4 MACS
 | Mac mini G4 (Early 2005) | PowerMac10,1 | Unconfirmed |
 | iBook G4 (2004, Radeon 9200) | PowerBook6,5 | Yes |
 | iBook G4 (2003, Radeon 9200) | PowerBook6,3 | Unconfirmed |
-| Al PowerBook G4 12-inch 867MHz | PowerBook6,1 | Unconfirmed |
+| Al PowerBook G4 12-inch 867MHz | PowerBook6,1 | Yes |
 | Al PowerBook G4 12-inch 1.0-1.5GHz | PowerBook6,2 / 6,4 / 6,8 | Unconfirmed |
 | Al PowerBook G4 17-inch 1.0GHz | PowerBook5,1 | Unconfirmed |
 | Al PowerBook G4 15/17-inch (Radeon) | PowerBook5,2-5,7 | Unconfirmed |
