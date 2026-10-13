@@ -96,7 +96,7 @@ COMPATIBLE 802.11g BCM4306/BCM4318 NETWORKING CARDS
 
 | Brand | Model | Form Factor | Confirmed |
 |---|---|---|---|
-| Apple | A1026 | Internal |
+| Apple | A1026 | Internal | Yes |
 | Linksys | WMP54G v1.x | PCI card | Yes |
 | Linksys | WMP54GS v1.x | PCI card | Unconfirmed |
 | Linksys | WPC54G v1.x | CardBus card | Unconfirmed |
