@@ -5,7 +5,7 @@ A **Mac OS 9 driver for Broadcom BCM4306 and BCM4318 802.11g cards** to connect 
 AirPort Extreme card (A1026) as well as Linksys WMP54GS (PCI) and WPC54G (CardBus) adapters.
 
 Apple never shipped an OS 9 driver for the AirPort Extreme card, and the original 802.11b AirPort card tops out
-at WEP, which no modern network accepts. This driver puts a real, modern Wi-Fi connection on an OS 9 Mac
+at WEP, which no modern network accepts. This driver puts a real, modern Wi-Fi connection on an OS 9-booting Mac
 with its own hardware: it scans, joins WPA2-secured or open networks, remembers them, and rejoins on its
 own at start-up, all from a native control panel and Control Strip module, with no Mac OS X involved.
 
@@ -22,7 +22,7 @@ Three native OS 9 pieces:
   TCP/IP runs over it like any Ethernet port.
 - **AirPort Extreme** (control panel): signal and status, on/off, scan and choose a network, enter a
   password once, forget a network, and an About box.
-- **AirPort Extreme Strip** (Control Strip module): signal, on/off, and choosing a network from the strip.
+- **AirPort Extreme Strip** (Control Strip module, optional): signal, on/off, and choosing a network from the strip.
 
 ## Requirements
 
@@ -52,15 +52,12 @@ them (they are BinHex `.hqx` files; StuffIt Expander on OS 9 handles them). Or b
 
 ## Compatibility
 
-Confirmed on real hardware so far: the **Power Mac G4 MDD FW800** (the development machine, where
-WPA2-Personal and open joins were tested) and a **14-inch iBook G4** (2004, `PowerBook6,5`), the latter from
-a community report -- both with the BCM4306 AirPort Extreme card. Beyond the internal A1026, add-in Broadcom
-cards are confirmed too: the **BCM4318** on a BCM4318 **PCI** card (Linksys WMP54GS) at full 802.11g speed,
-and the **BCM4306** on a **CardBus** card in a TiBook (PowerBook G4) and even a **PowerBook G3 "Wallstreet"**.
-The driver no longer assumes the MDD's antenna wiring (it lets the card pick its antenna automatically), so
-it should work on any OS 9.2.2 Mac fitted with a supported Broadcom card. The table lists the OS 9-capable
+The first table below lists the OS 9-capable
 G4s that took the discrete **A1026** card: all are expected to work, but only the rows marked Yes are
-confirmed. Every other row needs a community report to move from No to Yes.
+confirmed.
+
+
+AIRPORT EXTREME (A1026) COMPATIBLE G4 MACS
 
 | Model | Model ID | Confirmed working |
 |---|---|---|
@@ -77,13 +74,33 @@ confirmed. Every other row needs a community report to move from No to Yes.
 | Al PowerBook G4 17-inch 1.0GHz | PowerBook5,1 | Unconfirmed |
 | Al PowerBook G4 15/17-inch (Radeon) | PowerBook5,2-5,7 | Unconfirmed |
 
-The A1026 card shipped in two chip revisions, and **both are now driven**: early cards
-are the **BCM4306** (`14e4:4320` or `14e4:4325`), later ones the **BCM4318** (`14e4:4318`). In Apple System
-Profiler any of those three PCI IDs is supported. BCM4318 support is new in this release and is confirmed on
-a BCM4318 **PCI** card (Linksys WMP54GS) at full 802.11g speed; the A1126/A1127 combo cards built into later
+The A1126/A1127 combo cards built into later
 machines -- Mac mini G4 (Late 2005, PowerMac10,2), iBook G4 Mid 2005 (PowerBook6,7), Al PowerBook G4 DLSD
-(PowerBook5,8 / 5,9) -- are the same chip and are **expected to work but have not yet been tested**; a report
-from one would be very welcome. The Xserve G4 had no AirPort option.
+(PowerBook5,8 / 5,9) -- are the same chip and are **expected to work but have not yet been tested**; let 
+me know if you are able to test one of these machines.
+
+
+OTHER CONFIRMED COMPATIBLE MACS*
+
+| Model | Model ID | Via |
+|---|---|---|
+| Power Mac G4 MDD FW400 | PowerMac3,6 | PCI card |
+| PowerBook G4 Titanium 667 DVI | PowerBook3,4 | CardBus |
+| PowerBook G3 Wallstreet | --- | CardBus |
+
+*This is not an exhaustive list. If you have a Mac running OS 9 that is not on the compatibility list, try 
+running this driver with a compatible card and let me know if it works!
+
+
+COMPATIBLE 802.11g BCM4306/BCM4318 NETWORKING CARDS
+
+| Brand | Model | Form Factor | Confirmed |
+|---|---|---|---|
+| Apple | A1026 | Internal |
+| Linksys | WMP54G v1.x | PCI card | Yes |
+| Linksys | WMP54GS v1.x | PCI card | Unconfirmed |
+| Linksys | WPC54G v1.x | CardBus card | Unconfirmed |
+| Linksys | WPC54GS v1.1 | CardBus card | Yes |
 
 Reports of success or failure are very welcome: please say which Mac, which card and its PCI ID, and what
 happened.
