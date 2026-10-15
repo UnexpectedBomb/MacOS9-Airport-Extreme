@@ -64,15 +64,20 @@ AIRPORT EXTREME (A1026) COMPATIBLE G4 MACS
 | Power Mac G4 MDD FW800 | PowerMac3,6 | Yes |
 | eMac G4 1.25GHz (USB 2.0) | PowerMac6,4 | Unconfirmed |
 | eMac G4 1.42GHz (2005) | PowerMac6,4 | Unconfirmed |
-| iMac G4 15-inch 1.0GHz | PowerMac6,3 | Unconfirmed |
-| iMac G4 17/20-inch 1.25GHz | PowerMac6,3 | Unconfirmed |
+| iMac G4 15" 1.0GHz | PowerMac6,3 | Unconfirmed |
+| iMac G4 17/20" 1.25GHz | PowerMac6,3 | Unconfirmed |
 | Mac mini G4 (Early 2005) | PowerMac10,1 | Unconfirmed |
 | iBook G4 (2004, Radeon 9200) | PowerBook6,5 | Yes |
 | iBook G4 (2003, Radeon 9200) | PowerBook6,3 | Unconfirmed |
-| Al PowerBook G4 12-inch 867MHz | PowerBook6,1 | Yes |
-| Al PowerBook G4 12-inch 1.0-1.5GHz | PowerBook6,2 / 6,4 / 6,8 | Unconfirmed |
-| Al PowerBook G4 17-inch 1.0GHz | PowerBook5,1 | Unconfirmed |
-| Al PowerBook G4 15/17-inch (Radeon) | PowerBook5,2-5,7 | Unconfirmed |
+| Al PowerBook G4 12" 867MHz | PowerBook6,1 | Yes |
+| Al PowerBook G4 12" 1.0-1.5GHz | PowerBook6,2 / 6,4 / 6,8 | Unconfirmed |
+| Al PowerBook G4 17" 1.0GHz | PowerBook5,1 | Unconfirmed |
+| Al PowerBook G4 15" 1.0/1.25GHz | PowerBook5,2 | Unconfirmed |
+| Al PowerBook G4 17" 1.33GHz | PowerBook5,3 | Unconfirmed |
+| Al PowerBook G4 15" 1.33/1.5GHz | PowerBook5,4 | Unconfirmed |
+| Al PowerBook G4 17" 1.5GHz | PowerBook5,5 | Yes |
+| Al PowerBook G4 15" 1.5/1.67GHz | PowerBook5,6 | Unconfirmed |
+| Al PowerBook G4 17" 1.67GHz | PowerBook5,7 | Unconfirmed |
 
 The A1126/A1127 combo cards built into later
 machines -- Mac mini G4 (Late 2005, PowerMac10,2), iBook G4 Mid 2005 (PowerBook6,7), Al PowerBook G4 DLSD
