@@ -30,9 +30,9 @@ Three native OS 9 pieces:
   see [Compatibility](#compatibility) for other machines.
 - A **Broadcom BCM4306 or BCM4318 802.11g card**. The common BCM4306 is Apple's **A1026** (PCI ID
   `14e4:4320`); the **BCM4318** (`14e4:4318`) is the later single-chip part, used on the A1126 / A1127
-  Wi-Fi/Bluetooth combo cards and on PCI/CardBus adapters such as the Linksys WMP54GS. **Both are driven.**
-  The driver checks the card at start-up and steps aside cleanly if it is neither, so an unsupported card
-  does no harm.
+  Wi-Fi/Bluetooth combo cards and on PCI/CardBus adapters such as the Linksys WMP54GS. **Both are driven**,
+  except some of the very earliest A1026 cards (see [Compatibility](#compatibility)). The driver checks the
+  card at start-up and steps aside cleanly if it cannot drive it, so an unsupported card does no harm.
 - **Broadcom firmware** is already embedded in the pre-built driver on the [Releases](../../releases) page,
   so if you use the download there is nothing extra to fetch. Only when you build from source do you retrieve
   it yourself, a one-line fetch described in [firmware/README.md](firmware/README.md).
@@ -56,6 +56,12 @@ The first table below lists the OS 9-capable
 G4s that took the discrete **A1026** card: all are expected to work, but only the rows marked Yes are
 confirmed.
 
+**One known exception: the earliest A1026 cards.** Some of the first A1026 cards use an older revision of
+the BCM4306 chip that this release cannot start yet; it was found on a 17-inch 1.0GHz PowerBook G4
+(PowerBook5,1). On such a card the driver steps aside without harm, and the **AirPort Driver Log** in the
+System Folder reports that the microcode is not up. It is the card, not the Mac: a later A1026 in the same
+machine is expected to work. Support for these early cards is in development.
+
 
 AIRPORT EXTREME (A1026) COMPATIBLE G4 MACS
 
@@ -71,13 +77,16 @@ AIRPORT EXTREME (A1026) COMPATIBLE G4 MACS
 | iBook G4 (2003, Radeon 9200) | PowerBook6,3 | Unconfirmed |
 | Al PowerBook G4 12" 867MHz | PowerBook6,1 | Yes |
 | Al PowerBook G4 12" 1.0-1.5GHz | PowerBook6,2 / 6,4 / 6,8 | Unconfirmed |
-| Al PowerBook G4 17" 1.0GHz | PowerBook5,1 | Unconfirmed |
+| Al PowerBook G4 17" 1.0GHz | PowerBook5,1 | No (early A1026 card, see above) |
 | Al PowerBook G4 15" 1.0/1.25GHz | PowerBook5,2 | Unconfirmed |
 | Al PowerBook G4 17" 1.33GHz | PowerBook5,3 | Unconfirmed |
 | Al PowerBook G4 15" 1.33/1.5GHz | PowerBook5,4 | Unconfirmed |
-| Al PowerBook G4 17" 1.5GHz | PowerBook5,5 | Yes |
+| Al PowerBook G4 17" 1.5GHz | PowerBook5,5 | Yes¹ |
 | Al PowerBook G4 15" 1.5/1.67GHz | PowerBook5,6 | Unconfirmed |
 | Al PowerBook G4 17" 1.67GHz | PowerBook5,7 | Unconfirmed |
+
+¹ On the reported PowerBook5,5, keep Apple's **AirPort AP Support** extension installed; see
+[Coexistence](#coexistence-with-apples-airport-software).
 
 The A1126/A1127 combo cards built into later
 machines -- Mac mini G4 (Late 2005, PowerMac10,2), iBook G4 Mid 2005 (PowerBook6,7), Al PowerBook G4 DLSD
@@ -115,13 +124,15 @@ happened.
 ## Coexistence with Apple's AirPort software
 
 This driver is independent and runs alongside Apple's original AirPort software, so you do not need to
-remove Apple's AirPort extensions. It claims the AirPort Extreme (BCM4306) card as its own Open Transport
-port (`OTModl$AirPortBCM`), separate from Apple's driver for the original 802.11b card.
+remove Apple's AirPort extensions. It claims the BCM4306 or BCM4318 card as its own Open Transport port
+(`OTModl$AirPortBCM`), separate from Apple's driver for the original 802.11b card.
 
 One caveat, and it is an Apple bug rather than this driver's: Apple's **AirPort AP** extension crashes at
 startup if the **TCP/IP Preferences** file is missing or corrupt *and* no original 802.11b AirPort card is
-present. If you do not use an original AirPort card you can safely remove **AirPort AP** and **AirPort AP
-Support**; **AirPort Driver** can stay (it just finds no card and idles). And do not delete TCP/IP
+present. If you do not use an original AirPort card, you can remove **AirPort AP**. You can usually remove
+**AirPort AP Support** too (fine on a Power Mac G4 MDD), but on some Macs that has frozen the AirPort
+Extreme control panel when it opens (reported on a PowerBook5,5); if that happens, put **AirPort AP
+Support** back. **AirPort Driver** can stay (it just finds no card and idles). And do not delete TCP/IP
 Preferences while **AirPort AP** is installed.
 
 ## Use
@@ -137,8 +148,9 @@ Not supported: WEP, the original WPA/TKIP, WPA3-only (SAE), or 802.1X / Enterpri
 
 ## Limitations
 
-- Confirmed on the MDD FW800 and a 14-inch iBook G4 (BCM4306), on a BCM4318 PCI card, and on BCM4306 CardBus
-  cards (TiBook and a PowerBook G3); other machines rely on community reports (see [Compatibility](#compatibility)).
+- Confirmed only on the Macs and cards listed as confirmed in [Compatibility](#compatibility); everything else
+  relies on community reports.
+- Some of the earliest A1026 cards are not supported yet (see [Compatibility](#compatibility)).
 - No hidden-network ("closed SSID" / manual "Other...") entry yet.
 - With a base station that presents several BSSIDs for one SSID, a join may occasionally come back from a
   different BSSID of the same network; this is being hardened.
@@ -165,3 +177,4 @@ affiliated with or endorsed by Apple.
 
 - [MacOS9-USB2-EHCI](https://github.com/UnexpectedBomb/MacOS9-USB2-EHCI): USB 2.0 for Mac OS 9
 - [MacOS9-FW800-FireWire](https://github.com/UnexpectedBomb/MacOS9-FW800-FireWire): FireWire 800 fix
+- [MacOS9-Bluetooth](https://github.com/UnexpectedBomb/MacOS9-Bluetooth): Bluetooth keyboards and mice for Mac OS 9
