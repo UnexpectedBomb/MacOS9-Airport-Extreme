@@ -135,6 +135,17 @@ static unsigned long gRxDeferTb[32];
 #define AP_RXW_TAKEN(slot)        do{ unsigned long t_ = gRxDeferTb[(slot) & 31]; \
                                       if(t_){ ApTbHistAdd(&gTbRxDeferWait, ApTbNow() - t_); gRxDeferTb[(slot) & 31] = 0; } }while(0)
 
+/* ★ k244: SELF-PINPOINTING INSIDE THE PHY HEADERS. k243 stopped silently somewhere after the firmware
+ * upload on the tester's BCM4306/2, and the rev-1 PHY path it was running for the first time had no
+ * flush in it, so the log could not say where. ap_phy_initg.h (and ap_chipinit_tail.h, which includes
+ * it) arrive through ap_eapol.h's chain just below -- long before ApDiagMark exists -- so they mark
+ * through this hook, the same arrangement as the stopwatch hooks above: this file defines it, every
+ * other includer (the app) keeps the header's no-op. A mark is Say + flush, so a hang leaves the block
+ * it names as the log's last line. Every caller is task level (Open, Rejoin), and the flush is guarded
+ * to task level regardless. */
+static void ApShimDumpRingToFile(void);
+#define AP_PHY_MARK(s)            do{ Say(s); ApShimDumpRingToFile(); }while(0)
+
 /* 8-2d-2a: the hardware half, taken whole rather than transcribed. See the note below.
  * 8-2d-3: ap_phy_initg.h includes ap_bringup.h itself, so taking the PHY header gets both. */
 #include "ap_eapol.h"   /* 8-4; brings ap_wait.h, ap_tx.h and the whole stack below it.
@@ -240,13 +251,273 @@ static UInt8   gShimMac[6];
 static int     gShimMacOk   = 0;             /* the six bytes are real */
 static OSStatus gShimMapErr = 1;             /* 1 = never attempted, so it can be told from noErr */
 
+/* ★★ k240: THE LIFECYCLE BLOCK -- what happened between loads, kept where it outlives the module.
+ *
+ * ★ WHY. Open Transport unloads this module when TCP/IP closes the last stream on our port, and TCP/IP
+ * closes them at every sleep: OTInetControllerLib's kOTSystemSleep handler unloads the whole stack unless
+ * wake-on-network is set (read 2026-10-26 from OS 9.2.2's Open Transport, OTInetControllerLib code 0xa07c:
+ * PMFeatures & 0x2000 and GetWakeOnNetworkOptions & 4, else close). So a sleep is an unload and, later, a
+ * fresh load of a NEW copy of this fragment that knows nothing of the old one. What the next load needs --
+ * when the old copy went, whether the link was up, whether it got its DMA memory back, how the card's config
+ * looked at this boot's first acquisition -- lives here instead: system heap, Gestalt 'APXl', found and
+ * reused by every load this boot exactly as the status block is (ApStatPublish), never freed.
+ * It also tells the log a load is a RE-load: the boot's first load starts the driver log and every later
+ * load appends (k204's first flush of a load deleted it, which after a sleep would erase the very session
+ * the wake is compared with). Task level only. */
+#define kApLifeSelector  0x4150586CUL     /* Gestalt 'APXl' */
+#define kApLifeMagic     0x41504C46UL     /* 'APLF' */
+#define kApLifeVersion   1UL
+typedef struct {
+    UInt32 magic, version, size;
+    UInt32 loads, unloads;               /* this boot */
+    UInt32 loadTicks, loadSecs;          /* the latest load: TickCount, GetDateTime */
+    UInt32 unloadTicks, unloadSecs;      /* the latest unload */
+    UInt32 unloadBuild;                  /* AP_OTMODL_BUILD of the copy that unloaded */
+    UInt32 unloadLinkUp;                 /* 1 = it was associated when Open Transport unloaded it */
+    UInt32 unloadQopens, unloadQcloses;  /* that copy's stream opens and closes */
+    UInt32 unloadQuiesce;                /* kApQz*: what its teardown confirmed */
+    UInt32 unloadDmaFreed;               /* 1 = it gave its DMA memory back; 0 = kept it (see ApShimReleaseDma) */
+    UInt32 bootValid;                    /* 1 = boot* hold the card's config as the firmware left it */
+    UInt32 bootCmdSts, bootLatCls, bootBar0;
+    UInt32 restores;                     /* acquisitions this boot that put the card's config back */
+    UInt32 reusedInstances;              /* InitStreamModule on a copy whose teardown already ran (refused) */
+} ApLifeBlock;
+static ApLifeBlock *gApLife = 0;
+static UInt32       gLifePrev[sizeof(ApLifeBlock) / 4];   /* the block as this load found it, for the log */
+
+/* kApQz*: what ApOtmHalClose's teardown could confirm (ApShimQuiesceChecked). */
+#define kApQzRxStopped  0x01UL   /* the RX engine reported DISABLED */
+#define kApQzTxStopped  0x02UL   /* the TX engine reported DISABLED (or there is none) */
+#define kApQzMacOk      0x04UL   /* MacSuspend saw MAC_SUSPENDED (or the MAC was not on) */
+#define kApQzNoEngines  0x08UL   /* the engines never ran this load: nothing to stop */
+#define kApQzCardReset  0x10UL   /* config space says the card lost its BAR: reset, so no register was touched */
+#define kApQzNoCore     0x20UL   /* the 802.11 core could not be selected: no register was touched */
+
+/* Called first thing from InitStreamModule. */
+void ApOtmLifeLoad(void)
+{
+    long v = 0; unsigned long secs = 0; UInt32 i;
+    if(!gApLife && Gestalt((OSType)kApLifeSelector, &v) == noErr && v){
+        ApLifeBlock *b = (ApLifeBlock *)v;
+        if(b->magic == kApLifeMagic && b->version == kApLifeVersion && b->size == (UInt32)sizeof(ApLifeBlock))
+            gApLife = b;
+    }
+    if(!gApLife){
+        ApLifeBlock *b = (ApLifeBlock *)NewPtrSysClear((Size)sizeof(ApLifeBlock));
+        if(!b) return;
+        b->magic = kApLifeMagic; b->version = kApLifeVersion; b->size = (UInt32)sizeof(ApLifeBlock);
+        if(NewGestaltValue((OSType)kApLifeSelector, (long)b) != noErr &&
+           ReplaceGestaltValue((OSType)kApLifeSelector, (long)b) != noErr){ DisposePtr((Ptr)b); return; }
+        gApLife = b;
+    }
+    for(i = 0; i < sizeof(ApLifeBlock) / 4; i++) gLifePrev[i] = ((const UInt32 *)gApLife)[i];
+    gApLife->loads++;
+    gApLife->loadTicks = (UInt32)TickCount();
+    GetDateTime(&secs); gApLife->loadSecs = (UInt32)secs;
+}
+
+/* Called first thing from TerminateStreamModule, before the teardown changes the link state.
+ * gLinkUpFlag is defined with the link layer, below; this is its tentative declaration. */
+static volatile int gLinkUpFlag;
+void ApOtmLifeUnload(UInt32 qopens, UInt32 qcloses)
+{
+    extern UInt32 gApOtmodlBuild;
+    unsigned long secs = 0;
+    if(!gApLife) return;
+    gApLife->unloads++;
+    gApLife->unloadTicks = (UInt32)TickCount();
+    GetDateTime(&secs); gApLife->unloadSecs = (UInt32)secs;
+    gApLife->unloadBuild = gApOtmodlBuild;
+    gApLife->unloadLinkUp = gLinkUpFlag ? 1UL : 0UL;
+    gApLife->unloadQopens = qopens; gApLife->unloadQcloses = qcloses;
+    gApLife->unloadQuiesce = 0; gApLife->unloadDmaFreed = 0;   /* ApOtmHalClose writes these next */
+}
+
+/* InitStreamModule on a copy whose teardown already ran (ap_otmodl.c gTerminated): counted, said, refused. */
+static void ApShimDumpRingToFile(void);
+void ApOtmLifeReused(void)
+{
+    if(gApLife) gApLife->reusedInstances++;
+    Say("");
+    Say("  [k240] \xE2\x9B\x94 Open Transport re-initialised a copy of this module whose teardown already ran.");
+    Say("    Every once-per-load bring-up step would be skipped on a card that may have lost power, so the");
+    Say("    bring-up is REFUSED: the port will not open. Restart, or switch TCP/IP away and back.");
+    ApShimDumpRingToFile();
+}
+
+static void ApShimSayQz(UInt32 qz)
+{
+    if(qz & kApQzNoEngines){ Say("      its teardown: the DMA engines never ran in that load -- nothing to stop"); return; }
+    if(qz & kApQzCardReset){ Say("      its teardown: config space said the card had lost its BAR (reset) -- no register touched"); return; }
+    if(qz & kApQzNoCore)   { Say("      its teardown: \xE2\x9A\xA0 could not select the 802.11 core -- no register touched"); return; }
+    Say((qz & kApQzRxStopped) ? "      its teardown: RX engine STOPPED (reported disabled)"
+                              : "      its teardown: \xE2\x9A\xA0 RX engine did NOT report stopped");
+    Say((qz & kApQzTxStopped) ? "                    TX engine STOPPED (reported disabled)"
+                              : "                    \xE2\x9A\xA0 TX engine did NOT report stopped");
+    Say((qz & kApQzMacOk)     ? "                    MAC suspended"
+                              : "                    \xE2\x9A\xA0 MAC did not report suspended");
+}
+
+/* The banner of a load, and what happened since the last one. Task level (FindCard's first call). */
+static void ApShimSayLife(void)
+{
+    extern UInt32 gApOtmodlBuild;
+    const ApLifeBlock *p = (const ApLifeBlock *)gLifePrev;
+    Str255 L;
+    Say("");
+    L[0] = 0; PCat(L, "  [k240] ===== AirPort Extreme driver LOADED -- OTMODL build "); PCatDec(L, gApOtmodlBuild);
+    if(gApLife){ PCat(L, ", load "); PCatDec(L, gApLife->loads); PCat(L, " this boot"); }
+    PCat(L, " ====="); Out(L);
+    if(!gApLife){ Say("    (no lifecycle block: Gestalt or the system heap refused it -- the log restarts on every load)"); return; }
+    if(gApLife->loads <= 1){ Say("    the first load this boot"); return; }
+    if(p->unloads == 0){ Say("    \xE2\x9A\xA0 an earlier load this boot was never unloaded (no teardown ran before this load)"); return; }
+    L[0] = 0; PCat(L, "    previous copy (build "); PCatDec(L, p->unloadBuild); PCat(L, ") was unloaded ");
+    PCatDec(L, (unsigned long)(gApLife->loadSecs - p->unloadSecs)); PCat(L, " s before this load (");
+    PCatDec(L, (unsigned long)(gApLife->loadTicks - p->unloadTicks)); PCat(L, " ticks)"); Out(L);
+    L[0] = 0; PCat(L, "      the link was "); PCat(L, p->unloadLinkUp ? "UP" : "down");
+    PCat(L, " when Open Transport unloaded it; its streams opened "); PCatDec(L, p->unloadQopens);
+    PCat(L, ", closed "); PCatDec(L, p->unloadQcloses); Out(L);
+    ApShimSayQz(p->unloadQuiesce);
+    Say(p->unloadDmaFreed ? "      its DMA memory (~228 KB, locked) was RELEASED to the system heap"
+                          : "      \xE2\x9A\xA0 its DMA memory was KEPT (not released: see the teardown lines above)");
+    if(gApLife->bootValid){
+        L[0] = 0; PCat(L, "    this boot's card config as the firmware left it: BAR0 0x"); PCatHex(L, gApLife->bootBar0, 8);
+        PCat(L, ", latency timer "); PCatDec(L, (gApLife->bootLatCls >> 8) & 0xFFUL);
+        PCat(L, ", cache line "); PCatDec(L, gApLife->bootLatCls & 0xFFUL); PCat(L, " words"); Out(L);
+    }
+    Say1("    acquisitions this boot that had to put the card's config back: ", gApLife->restores);
+}
+
+/* k240: acquisition attempts, AP_ACQ_WAIT_US apart, while the answer may still change by itself -- a CardBus
+ * socket Card Services has not re-enumerated yet, a card not answering yet. ~5 s, spent once per load. */
+#define AP_ACQ_TRIES    20
+#define AP_ACQ_WAIT_US  250000UL
+static UInt32 gAcqTries  = 0;            /* attempts the latest acquisition took */
+static int    gAcqWaited = 0;            /* this load has spent its wait (ApOtmHalOpen calls FindCard again) */
+
+static int ApShimAcqMayChange(OSStatus e)
+{
+    if(e == -1) return 1;                /* no node: Card Services may still be re-creating it */
+    if(e != kSsbErrRefused) return 0;
+    return gBus.acqRefused == kSsbAcqNoAnswer || gBus.acqRefused == kSsbAcqBridgeBad ||
+           gBus.acqRefused == kSsbAcqNotOurs  || gBus.acqRefused == kSsbAcqCfgFail;
+}
+
+static void ApShimSayCmd(Str255 L, UInt32 cmdSts)
+{
+    PCat(L, (cmdSts & 0x0002UL) ? " memory decode ON," : " memory decode off,");
+    PCat(L, (cmdSts & 0x0004UL) ? " bus master ON" : " bus master off");
+    if(cmdSts & 0x00100000UL) PCat(L, ", capability list");
+}
+
+/* The acquisition, decoded, then flushed BEFORE the first access through the BAR (task level). */
+static void ApShimSayAcquire(void)
+{
+    Str255 L; UInt32 r = gBus.acqRefused;
+    L[0] = 0; PCat(L, "  [k240] \xE2\x98\x85 CARD ACQUISITION -- the PCI config as found, BEFORE anything was written (attempts ");
+    PCatDec(L, gAcqTries); PCat(L, ")"); Out(L);
+    if(gShimMapErr == -1){ Say("    no Broadcom 4306/4318 node in the Name Registry -- nothing to acquire"); return; }
+    if(gShimMapErr != noErr && gShimMapErr != kSsbErrRefused){
+        SayH("    the node's assigned-addresses / AAPL,address could not be read: err ", (unsigned long)(long)gShimMapErr, 8); return; }
+    if(gBus.acqKind == kSsbKindCardBus){
+        L[0] = 0; PCat(L, "    where the card sits: CardBus (the bridge is ");
+        PCatDec(L, gBus.acqBridgeLevel + 1UL); PCat(L, gBus.acqBridgeLevel ? " levels up)" : " level up)");
+        PCat(L, " -- Card Services owns its config, never written here"); Out(L);
+    } else Say(gBus.acqKind == kSsbKindPci
+               ? "    where the card sits: PCI (the A1026 AirPort slot, or a PCI card) -- restorable"
+               : "    where the card sits: \xE2\x9A\xA0 no cardbus ancestor and the parent is not pci -- treated as not ours to write");
+    if(gBus.acqChainN){                      /* k241: the ancestors as walked, nearest first */
+        UInt32 k;
+        L[0] = 0; PCat(L, "    ancestors: ");
+        for(k = 0; k < gBus.acqChainN && k < kSsbChainMax; k++){
+            if(k) PCat(L, " < ");
+            PCat(L, gBus.acqChainName[k][0] ? gBus.acqChainName[k] : "(no name)");
+            PCat(L, " [");
+            PCat(L, gBus.acqChainType[k][0] ? gBus.acqChainType[k] : "no device_type");
+            PCat(L, "]");
+        }
+        Out(L);
+    }
+    if(gBus.acqKind == kSsbKindCardBus && gBus.acqBridgeCmd == 0xFFFFFFFFUL)
+        Say("    bridge config: not readable through the Expansion Manager -- not used; the card's own checks decide");
+    else if(gBus.acqKind == kSsbKindCardBus){
+        L[0] = 0; PCat(L, "    bridge 0x18 bus numbers = 0x"); PCatHex(L, gBus.acqBridgeBus, 8);
+        PCat(L, ": PCI bus "); PCatDec(L, gBus.acqBridgeBus & 0xFFUL);
+        PCat(L, ", CardBus bus "); PCatDec(L, (gBus.acqBridgeBus >> 8) & 0xFFUL);
+        PCat(L, ", subordinate "); PCatDec(L, (gBus.acqBridgeBus >> 16) & 0xFFUL); Out(L);
+        L[0] = 0; PCat(L, "    bridge 0x04 command     = 0x"); PCatHex(L, gBus.acqBridgeCmd, 8); PCat(L, ":");
+        ApShimSayCmd(L, gBus.acqBridgeCmd); Out(L);
+        if(r == kSsbAcqBridgeBad){ Say("    => REFUSED: the bridge has not been set up (Card Services not done) -- the card was not asked"); return; }
+    }
+    if(r == kSsbAcqCfgFail){ Say("    => REFUSED: a config-space read failed -- nothing written"); return; }
+    L[0] = 0; PCat(L, "    0x00 vendor/device      = 0x"); PCatHex(L, gBus.acqVidDid, 8);
+    PCat(L, ((gBus.acqVidDid & 0xFFFFUL) == kVendorBroadcom) ? "  Broadcom " : "  NOT Broadcom");
+    if((gBus.acqVidDid & 0xFFFFUL) == kVendorBroadcom) PCatHex(L, gBus.acqVidDid >> 16, 4);
+    Out(L);
+    if(r == kSsbAcqNoAnswer){ Say("    => REFUSED: the card does not answer (0xFFFFFFFF = no power, or not there) -- nothing written"); return; }
+    L[0] = 0; PCat(L, "    0x04 command/status     = 0x"); PCatHex(L, gBus.acqCmdSts, 8); PCat(L, ":");
+    ApShimSayCmd(L, gBus.acqCmdSts); Out(L);
+    L[0] = 0; PCat(L, "    0x0C BIST|hdr|lat|cls   = 0x"); PCatHex(L, gBus.acqLatCls, 8);
+    PCat(L, ": latency timer "); PCatDec(L, (gBus.acqLatCls >> 8) & 0xFFUL);
+    PCat(L, ", cache line "); PCatDec(L, gBus.acqLatCls & 0xFFUL); PCat(L, " words"); Out(L);
+    L[0] = 0; PCat(L, "    0x10 BAR0               = 0x"); PCatHex(L, gBus.acqBar0, 8);
+    if((gBus.acqBar0 & 0xFFFFFFF0UL) == (gBus.acqBar0Want & 0xFFFFFFF0UL)) PCat(L, "  = the registry's (kept its config)");
+    else { PCat(L, "  \xE2\x89\xA0 the registry's 0x"); PCatHex(L, gBus.acqBar0Want, 8);
+           if((gBus.acqBar0 & 0xFFFFFFF0UL) == 0) PCat(L, " -- POWER-ON DEFAULT: the slot lost power"); }
+    Out(L);
+    if(gBus.acqPm){
+        L[0] = 0; PCat(L, "    PMCSR (config 0x"); PCatHex(L, gBus.acqPm >> 16, 2); PCat(L, ")      = 0x");
+        PCatHex(L, gBus.acqPm & 0xFFFFUL, 4); PCat(L, ": D"); PCatDec(L, gBus.acqPm & 0x3UL);
+        if(gBus.acqPm & 0x8000UL) PCat(L, ", PME_Status set");
+        Out(L);
+    } else Say("    no PCI power-management capability found");
+    if(r == kSsbAcqNotOurs){ Say("    => REFUSED: not in D0, or BAR0 not the registry's, and not ours to write (Card Services not done)"); return; }
+    if(r == kSsbAcqPmStuck){ Say("    => REFUSED: PMCSR would not go to D0 -- the BAR was not touched"); return; }
+    if(r == kSsbAcqBar0Stuck){ Say("    => REFUSED: BAR0 would not take the registry's address"); return; }
+    if(!gBus.acqFixed){ Say("    => acquired: nothing to put back"); return; }
+    L[0] = 0; PCat(L, "    => acquired, PUT BACK:");
+    if(gBus.acqFixed & kSsbFixD0)     PCat(L, " D0;");
+    if(gBus.acqFixed & kSsbFixBar0)  { PCat(L, " BAR0 0x"); PCatHex(L, gBus.acqBar0Want, 8); PCat(L, ";"); }
+    if(gBus.acqFixed & kSsbFixLatCls){ PCat(L, " latency/cache line 0x"); PCatHex(L, gBus.restoreLatCls & 0xFFFFUL, 4); PCat(L, ";"); }
+    Out(L);
+    if((gBus.acqFixed & kSsbFixBar0) && !gBus.restoreLatClsOk)
+        Say("      (latency timer / cache line left at the reset value: no load this boot saw the firmware's)");
+}
+
+/* After a successful acquisition: the boot's first look at the card, or one more restore. */
+static void ApLifeNoteAcquire(void)
+{
+    if(!gApLife) return;
+    if(gBus.acqFixed){ gApLife->restores++; return; }
+    if(!gApLife->bootValid){
+        gApLife->bootCmdSts = gBus.acqCmdSts; gApLife->bootLatCls = gBus.acqLatCls;
+        gApLife->bootBar0 = gBus.acqBar0; gApLife->bootValid = 1; }
+}
+
 /* Called from EnetHAL_Open only. Task time: Name Registry, PCI config and a mapping are all legal
- * here and nowhere else in this file. */
+ * here and nowhere else in this file.
+ * ★ k240: and from the native module's InitStreamModule, where a load can now follow a sleep that cut the
+ *   slot's power. The card is acquired (SsbAcquire, ssb_core.h) before its first access through the BAR,
+ *   the record is logged and FLUSHED before that access, and a CardBus card Card Services has not set up
+ *   again yet is waited for, briefly. */
+static void ApShimDumpRingToFile(void);     /* defined far below; forward-declared for the acquisition */
 static void ApShimFindCard(void)
 {
     UInt16 w0,w1,w2;
     if(gShimMacOk) return;                   /* once per load */
-    gShimMapErr = SsbFindAndMap(&gBus);
+    if(!gAcqWaited) ApShimSayLife();
+    gBus.restoreLatClsOk = (gApLife && gApLife->bootValid) ? 1UL : 0UL;
+    gBus.restoreLatCls   = gBus.restoreLatClsOk ? gApLife->bootLatCls : 0;
+    gAcqTries = 0;
+    for(;;){
+        gAcqTries++;
+        gShimMapErr = SsbFindAndMap(&gBus);
+        if(gShimMapErr == noErr || gAcqWaited || gAcqTries >= AP_ACQ_TRIES || !ApShimAcqMayChange(gShimMapErr)) break;
+        SsbSpinUs(AP_ACQ_WAIT_US);
+    }
+    gAcqWaited = 1;
+    ApShimSayAcquire();
+    ApShimDumpRingToFile();                  /* before the first access through the BAR: a fault leaves the record */
     if(gShimMapErr != noErr) return;
     if(gBus.bar0 == 0) { gShimMapErr = paramErr; return; }
 
@@ -268,6 +539,7 @@ static void ApShimFindCard(void)
       for(i=0;i<6;i++){ if(gShimMac[i]!=0x00) allz=0; if(gShimMac[i]!=0xFF) allf=0; }
       if(allz || allf || (gShimMac[0] & 0x01)) { gShimMacOk = 0; gShimMapErr = paramErr; return; } }
     gShimMacOk = 1;
+    ApLifeNoteAcquire();                     /* k240 */
 }
 
 /* ── 8-2a: the backplane, enumerated by the driver itself ──
@@ -361,6 +633,17 @@ UInt32 AirPortShimArm(UInt32 allow)
     return was;
 }
 
+/* ── k238 DIAGNOSTIC plumbing ─────────────────────────────────────────────────────────────────
+ * The k237 card dump crashed somewhere in its own reads (both a 4306 A1026 and the MDD), and because
+ * nothing flushed after [8-69] we could not see WHICH read. These make the dump SELF-PINPOINTING:
+ * ApDiagMark writes a "about to read X" line AND flushes it to disk, so if the very next read faults,
+ * the log's LAST line names the register that did it. Task level only (ApShimDumpRingToFile self-guards
+ * on CurrentExecutionLevel()==0, and EnableCore runs at qopen). gDiagLine is a file-scope buffer so the
+ * 256-byte Str255 stays OFF EnableCore's stack frame (hedging the other suspect, stack depth). */
+static void ApShimDumpRingToFile(void);     /* defined far below; forward-declared for the diag */
+static Str255 gDiagLine;                     /* static: multi-value diag lines, not on the stack */
+static void ApDiagMark(const char *s) { Say(s); ApShimDumpRingToFile(); }
+
 /* Enable the 802.11 core. Task time only, and only when armed. */
 static void ApShimEnableCore(void)
 {
@@ -409,7 +692,95 @@ static void ApShimEnableCore(void)
         SayH("  [8-2d-3] switch_analog(1) done; PHY_VER = ",
              (unsigned long)ssb_r16(gBus.bar0,B43_MMIO_PHY_VER),4);
       } else {
-        gShimCoreErr = paramErr; } }
+        gShimCoreErr = paramErr;
+      }
+
+      /* ===== [DIAG k239] SELF-PINPOINTING read-only card dump. UNCONDITIONAL -- runs whether or not the
+       * 802.11 core came up, so it also dumps a card whose core never clocks (e.g. the tester's early A1026).
+       * k237/k238 crashed reading RESERVED ChipCommon offsets that TARGET-ABORT, and the aborting offset
+       * DIFFERS by chip (0x28 on the FW800 4306; 0x90 on the FW400 4318), so this reads ONLY the three CC
+       * registers proven safe on BOTH -- 0x00/0x04/0xFFC -- which already answer the pwrctl question
+       * (CAPABILITIES PCTL bit + core rev). Each MMIO read is still flushed-before (ApDiagMark) so any
+       * fresh abort still pinpoints itself. Reads only; the CC select is restored to the 802.11 core.
+       * [8-69] above already logged PMCSR + PCI command/status + GPIO_IN; RadioIdControl (if the core came
+       * up) the radio id. Placed AFTER the core-up if/else so it is captured on a card that fails earlier. */
+      {   UInt32 d32; UInt16 w0=0, w1=0; UInt16 pv[4]; int di, row, col;
+          UInt32 d_cur = gBus.idx80211;
+          Say("");
+          Say("  [DIAG k239] ===== CARD IDENTITY + STATE (read-only, unconditional; risky reads flushed BEFORE they run) =====");
+          Say(gShimCoreUp ? "  [DIAG] (802.11 core came up this boot)"
+                          : "  [DIAG] (802.11 core did NOT come up -- core/PHY reads below may be junk)");
+          ApShimDumpRingToFile();
+
+          /* --- PCI config header via ExpMgr (non-faulting, same path as [8-69]) --- */
+          (void)ExpMgrConfigReadWord(&gBus.node,(LogicalAddress)0x00,&w0);
+          (void)ExpMgrConfigReadWord(&gBus.node,(LogicalAddress)0x02,&w1);
+          SayH("  [DIAG] PCI vendor = ",(unsigned long)w0,4);
+          SayH("  [DIAG] PCI device = ",(unsigned long)w1,4);
+          (void)ExpMgrConfigReadWord(&gBus.node,(LogicalAddress)0x08,&w0);
+          (void)ExpMgrConfigReadWord(&gBus.node,(LogicalAddress)0x0A,&w1);
+          SayH("  [DIAG] PCI revision (chip stepping) = ",(unsigned long)(w0&0x00FFU),2);
+          SayH("  [DIAG] PCI class code = ",(unsigned long)w1,4);
+          (void)ExpMgrConfigReadWord(&gBus.node,(LogicalAddress)0x2C,&w0);
+          (void)ExpMgrConfigReadWord(&gBus.node,(LogicalAddress)0x2E,&w1);
+          SayH("  [DIAG] PCI subsystem vendor = ",(unsigned long)w0,4);
+          SayH("  [DIAG] PCI subsystem device (BOARD id) = ",(unsigned long)w1,4);
+          ApShimDumpRingToFile();
+
+          /* --- ChipCommon: ONLY the registers proven safe on both 4306 and 4318 (reserved offsets abort) --- */
+          if(gBus.idxChipCommon!=kSsbNoCore && SsbSelectCore(&gBus,gBus.idxChipCommon)==noErr){
+              ApDiagMark("  [DIAG] >> CC CHIPID 0x00");       d32=ssb_r32(gBus.bar0,CC_CHIPID);  SayH("  [DIAG] CC CHIPID       = ",(unsigned long)d32,8);
+              ApDiagMark("  [DIAG] >> CC CAPABILITIES 0x04"); d32=ssb_r32(gBus.bar0,0x0004UL);   SayH("  [DIAG] CC CAPABILITIES = ",(unsigned long)d32,8);
+              Say((d32&0x00040000UL)?"           PCTL bit 0x40000 SET  (power control present)":"           PCTL bit 0x40000 CLEAR (no power control)");
+              ApDiagMark("  [DIAG] >> CC IDHIGH 0xFFC");      d32=ssb_r32(gBus.bar0,SSB_IDHIGH); Say1("  [DIAG] CC core rev     = ",(unsigned long)IDHIGH_REV(d32));
+              Say((IDHIGH_REV(d32)>5UL)?"           cc rev > 5  (sb_pwrctl_clk gate passes)":"           cc rev <= 5 (sb_pwrctl_clk gate SKIPS -- pwrctl_clk is a no-op)");
+              (void)SsbSelectCore(&gBus,d_cur);   /* restore the 802.11 window */
+          } else Say("  [DIAG] (could not select ChipCommon)");
+          ApShimDumpRingToFile();
+
+          /* --- 802.11 core backplane state (real SSB registers 0xF90-0xFFC; flush-before each) --- */
+          ApDiagMark("  [DIAG] >> 80211 TMSLOW 0xF98");  d32=ssb_r32(gBus.bar0,SSB_TMSLOW);  SayH("  [DIAG] 80211 TMSLOW  = ",(unsigned long)d32,8);
+          Say(((d32&SSB_TMSLOW_CLOCK)&&!(d32&SSB_TMSLOW_RESET))?"           CLOCK set + RESET clear":"           ⚠ not (CLOCK set + RESET clear)");
+          ApDiagMark("  [DIAG] >> 80211 TMSHIGH 0xF9C"); d32=ssb_r32(gBus.bar0,SSB_TMSHIGH); SayH("  [DIAG] 80211 TMSHIGH = ",(unsigned long)d32,8);
+          Say((d32&SSB_TMSHIGH_SERR)?"           ⚠ SERR set":((d32&SSB_TMSHIGH_BUSY)?"           BUSY set":"           no SERR / BUSY"));
+          ApDiagMark("  [DIAG] >> 80211 IDLOW 0xFF8");   d32=ssb_r32(gBus.bar0,SSB_IDLOW);   SayH("  [DIAG] 80211 IDLOW   = ",(unsigned long)d32,8);
+          ApDiagMark("  [DIAG] >> 80211 IDHIGH 0xFFC");  d32=ssb_r32(gBus.bar0,SSB_IDHIGH);  Say1("  [DIAG] 80211 core rev = ",(unsigned long)IDHIGH_REV(d32));
+          ApDiagMark("  [DIAG] >> 80211 IMSTATE 0xF90"); d32=ssb_r32(gBus.bar0,SSB_IMSTATE); SayH("  [DIAG] 80211 IMSTATE = ",(unsigned long)d32,8);
+          ApShimDumpRingToFile();
+
+          /* --- PHY_VER x4 (stable=real, varying=unclocked; working 4306 reads 0x2202, the 4306/2 read 0x1201) --- */
+          ApDiagMark("  [DIAG] >> PHY_VER x4");
+          for(di=0;di<4;di++){ pv[di]=ssb_r16(gBus.bar0,B43_MMIO_PHY_VER); SsbSpinUs(200); }
+          gDiagLine[0]=0; PCat(gDiagLine,"  [DIAG] PHY_VER x4 = ");
+          PCatHex(gDiagLine,pv[0],4);PCat(gDiagLine," ");PCatHex(gDiagLine,pv[1],4);PCat(gDiagLine," ");
+          PCatHex(gDiagLine,pv[2],4);PCat(gDiagLine," ");PCatHex(gDiagLine,pv[3],4);Out(gDiagLine);
+          ApShimDumpRingToFile();
+
+          /* --- SPROM: first 64 words (boardflags 0x72 + wl0gpio + board rev); per-row flush --- */
+          ApDiagMark("  [DIAG] >> SPROM boardflags 0x72");
+          w0=ssb_r16(gBus.bar0,SSB_SPROM_BASE1+SPROM_BFLLO);
+          SayH("  [DIAG] SPROM board flags (0x72) = ",(unsigned long)w0,4);
+          for(row=0;row<8;row++){
+              gDiagLine[0]=0; PCat(gDiagLine,"  [DIAG] SPROM["); PCatHex(gDiagLine,(unsigned long)(row*16),2); PCat(gDiagLine,"] ");
+              for(col=0;col<8;col++){
+                  PCatHex(gDiagLine,(unsigned long)ssb_r16(gBus.bar0,
+                          SSB_SPROM_BASE1+(unsigned long)((row*8+col)*2)),4);
+                  PCat(gDiagLine," ");
+              }
+              Out(gDiagLine); ApShimDumpRingToFile();
+          }
+
+          /* --- PCI-config GPIO (0xB0/B4/B8 -- the space SsbPowerOn's dance drives; the 4306/2 read 0xFF) --- */
+          d32=0; (void)ExpMgrConfigReadLong(&gBus.node,(LogicalAddress)SSB_GPIO_IN,&d32);
+          SayH("  [DIAG] cfg GPIO_IN    0xB0 = ",(unsigned long)d32,8);
+          d32=0; (void)ExpMgrConfigReadLong(&gBus.node,(LogicalAddress)SSB_GPIO_OUT,&d32);
+          SayH("  [DIAG] cfg GPIO_OUT   0xB4 = ",(unsigned long)d32,8);
+          d32=0; (void)ExpMgrConfigReadLong(&gBus.node,(LogicalAddress)SSB_GPIO_OUTEN,&d32);
+          SayH("  [DIAG] cfg GPIO_OUTEN 0xB8 = ",(unsigned long)d32,8);
+          Say("  [DIAG k239] ===== END CARD IDENTITY + STATE =====");
+          ApShimDumpRingToFile();
+      }
+    }
 
     if(haveSaved)
       (void)ExpMgrConfigWriteLong(&gBus.node,(LogicalAddress)SSB_BAR0_WIN,savedWin);
@@ -458,6 +829,11 @@ static void ApShimEnableCore(void)
 static UInt16   gShimFwRev = 0;
 static UInt32   gShimFwIrq = 0;
 static OSStatus gShimFwErr = 1;
+/* ★ k244: the rest of what the upload can see, for ApShimSayFwResult. b43 and b43legacy both print rev,
+ * patch and build date from SHM 0x00-0x06 (same offsets in both generations); the poll count and the
+ * MACCTL readback say HOW the microcode came up, not just whether. */
+static UInt16   gShimFwPatch = 0, gShimFwDate = 0, gShimFwTime = 0, gShimFwStat = 0;
+static UInt32   gShimFwPolls = 0, gShimFwMacctl = 0, gShimFwCoreRev = 0;
 
 static UInt32 ApBe32(const unsigned char *p)
 { return ((UInt32)p[0]<<24)|((UInt32)p[1]<<16)|((UInt32)p[2]<<8)|(UInt32)p[3]; }
@@ -481,15 +857,12 @@ static int ApShimFwCheck(const unsigned char *b, UInt32 len, unsigned char want,
 
 static void ApShimLoadFirmware(void)
 {
-    const unsigned char *uc, *pc;
-    UInt32 ucLen, pcLen, w, words, macctl, irq, savedWin = 0;
-    int haveSaved, havePcm;
+    const unsigned char *uc, *pc, *ucBlob, *pcBlob;
+    UInt32 ucLen, pcLen, ucBlobLen, pcBlobLen, w, words, macctl, irq, savedWin = 0, coreRev, rUcode, rHw;
+    int haveSaved, havePcm, isV3;
 
     if(gShimFwRev != 0) return;                       /* once per load */
     if(!gShimCoreUp){ gShimFwErr = paramErr; return; } /* needs the core enabled first */
-
-    if(!ApShimFwCheck(kApFwUcode,kApFwUcode_LEN,'u',&uc,&ucLen)){ gShimFwErr = paramErr; return; }
-    havePcm = ApShimFwCheck(kApFwPcm,kApFwPcm_LEN,'p',&pc,&pcLen);
 
     haveSaved = (ExpMgrConfigReadLong(&gBus.node,(LogicalAddress)SSB_BAR0_WIN,
                                       &savedWin) == noErr);
@@ -499,9 +872,39 @@ static void ApShimLoadFirmware(void)
                                                 (LogicalAddress)SSB_BAR0_WIN,savedWin);
       return; }
 
+    /* ⚠ CORE REV READ LOCALLY, not from gShimCoreRev -- that global is set later (at ap_shim.c's
+     * dedicated core-rev read, which runs AFTER this), the ordering trap the 4318 effort hit. The
+     * 802.11 core is selected now, so IDHIGH is valid here. coreRev <= 4 is the BCM4306/2 (early
+     * A1026): it needs the v3 (b43legacy) firmware AND b43legacy SHM routing. rev >= 5 is the shipped
+     * v4 path, byte-for-byte unchanged. */
+    coreRev = IDHIGH_REV(ssb_r32(gBus.bar0,SSB_IDHIGH));
+    isV3    = (coreRev <= 4);
+    gShimIsV3 = isV3;                                /* latch for the TX path (fw3 txhdr dispatch) and PHY (pt3) */
+    gShimFwCoreRev = coreRev;
+    if(isV3){ ucBlob=kApFwUcodeV3; ucBlobLen=kApFwUcodeV3_LEN; pcBlob=kApFwPcmV3; pcBlobLen=kApFwPcmV3_LEN; }
+    else    { ucBlob=kApFwUcode;   ucBlobLen=kApFwUcode_LEN;   pcBlob=kApFwPcm;   pcBlobLen=kApFwPcm_LEN;   }
+    /* SHM routing, VALIDATED against Apple's wl 3.1.2 kext for this exact rev-4 card (oracle 2026-10-28):
+     *   UCODE: _wlc_write_ucode writes 0x03000000 -> routing 0x0300 for rev<=4 (v3); rev>=5 (v4) stays
+     *          0x0100 (our proven 4318/4306-3 path). ShmControl=(r<<16)|off, so v3 -> 0x03000000: EXACT.
+     *   PCM:   _wlc_write_pcm writes 0x000301EA -> routing 3, the SAME as our v4 path. (b43legacy's
+     *          SHM_HW 0x0004 also works on 4306/2, but 3 matches the test card exactly.) PCM is 3 BOTH gens. */
+    rUcode = isV3 ? (0x0300UL|0x0100UL) : (0x0000UL|0x0100UL);   /* SHM_UCODE|AUTOINC_W; v3->0x03000000 (oracle) */
+    rHw    = 3UL;                                                /* SHM_HW (PCM) -- routing 3 both gens (oracle) */
+
+    if(!ApShimFwCheck(ucBlob,ucBlobLen,'u',&uc,&ucLen)){
+      gShimFwErr = paramErr;
+      if(haveSaved) (void)ExpMgrConfigWriteLong(&gBus.node,
+                                                (LogicalAddress)SSB_BAR0_WIN,savedWin);
+      return; }
+    havePcm = ApShimFwCheck(pcBlob,pcBlobLen,'p',&pc,&pcLen);
+
     /* ⚠ INFRA IS NOT OPTIONAL HERE. ap_bringup.h records that it was missing from Stage 3b through
      * i4 and that its absence was a real defect -- b43_chip_init sets IHR|SHM|GMODE|INFRA before
      * b43_upload_microcode ORs in PSM_JMP0. Copying the working sequence, not a subset of it. */
+    /* ★ k244 marks: one per phase, flushed before it runs. Everything here but the blob and the ucode
+     * routing completed on this card in k239, so the phase a hang names is the evidence. */
+    ApDiagMark(isV3 ? "  [k244] >> fw: v3 (ucode4/pcm4) for core rev <= 4 -- MACCTL, then zero SHM"
+                    : "  [k244] >> fw: v4 for core rev >= 5 -- MACCTL, then zero SHM");
     macctl = B43_MACCTL_IHR_ENABLED|B43_MACCTL_SHM_ENABLED|B43_MACCTL_GMODE|B43_MACCTL_INFRA;
     ssb_w32(gBus.bar0,B43_MMIO_MACCTL,macctl); (void)ssb_r32(gBus.bar0,B43_MMIO_MACCTL);
     macctl = ssb_r32(gBus.bar0,B43_MMIO_MACCTL)|B43_MACCTL_PSM_JMP0;
@@ -511,14 +914,16 @@ static void ApShimLoadFirmware(void)
     for(w=0;w<4096;w+=4){ ShmControl(1UL,w>>2); ssb_w32(gBus.bar0,B43_MMIO_SHM_DATA,0); }
 
     words = ucLen/4;
-    ShmControl(0UL|0x0100UL,0x0000);                  /* SHM_UCODE | AUTOINC_W */
+    ApDiagMark("  [k244] >> fw: upload ucode");
+    ShmControl(rUcode,0x0000);                        /* SHM_UCODE | AUTOINC_W, generation-aware */
     for(w=0;w<words;w++){
       ssb_w32(gBus.bar0,B43_MMIO_SHM_DATA,ApBe32(uc+w*4)); SsbSpinUs(10); }
 
     if(havePcm){
       words = pcLen/4;
-      ShmControl(3UL,0x01EA); ssb_w32(gBus.bar0,B43_MMIO_SHM_DATA,0x00004000UL);
-      ShmControl(3UL,0x01EB);
+      ApDiagMark("  [k244] >> fw: upload pcm");
+      ShmControl(rHw,0x01EA); ssb_w32(gBus.bar0,B43_MMIO_SHM_DATA,0x00004000UL);
+      ShmControl(rHw,0x01EB);
       for(w=0;w<words;w++){
         ssb_w32(gBus.bar0,B43_MMIO_SHM_DATA,ApBe32(pc+w*4)); SsbSpinUs(10); } }
 
@@ -526,6 +931,7 @@ static void ApShimLoadFirmware(void)
      * the PSM, and this driver did not. The readiness test below waits for GEN_IRQ_REASON == 1,
      * so a stale bit from an earlier run could satisfy it before the microcode said anything --
      * a pass that means nothing, which is the worst kind. */
+    ApDiagMark("  [k244] >> fw: clear GEN_IRQ_REASON, PSM_RUN -- the microcode starts here; poll <= 1 s");
     ssb_w32(gBus.bar0,B43_MMIO_GEN_IRQ_REASON,0xFFFFFFFFUL);
     macctl = ssb_r32(gBus.bar0,B43_MMIO_MACCTL);
     macctl &= ~B43_MACCTL_PSM_JMP0; macctl |= B43_MACCTL_PSM_RUN;
@@ -538,18 +944,98 @@ static void ApShimLoadFirmware(void)
       if(irq == 0x00000001UL) break;
       SsbSpinUs(10000); }
     gShimFwIrq = irq;
+    gShimFwPolls = w;                                 /* 10 ms waits before ready; 100 = gave up */
     gShimFwRev = ShmRead16Shared(0x0000UL);
+    gShimFwPatch  = ShmRead16Shared(0x0002UL);        /* SH_UCODEPATCH (b43.h:320 = b43legacy.h:150) */
+    gShimFwDate   = ShmRead16Shared(0x0004UL);        /* SH_UCODEDATE */
+    gShimFwTime   = ShmRead16Shared(0x0006UL);        /* SH_UCODETIME */
+    gShimFwStat   = ShmRead16Shared(0x0040UL);        /* b43's SH_UCODESTAT; b43legacy defines no such word */
+    gShimFwMacctl = ssb_r32(gBus.bar0,B43_MMIO_MACCTL);
 
-    /* ⚠ b43's rule, not bwi's: reject rev <= 0x128. ap_bringup.h documents at length that this
-     * guard was backwards for twenty probes and cost Stage 5 most of its schedule. The driver
-     * inherits the CORRECTED form, and inherits it explicitly rather than by having copied code
-     * that happened to be right. */
+    /* ⚠ The rev gate is GENERATION-AWARE. 0x128 is the v3/v4 boundary: reference/b43legacy main.c
+     * rejects rev > 0x128 ("v4 firmware"); reference/b43 main.c rejects rev <= 0x128 -- exact mirrors.
+     * A rev<=4 core runs v3 ucode (rev <= 0x128); a rev>=5 core runs v4 (rev > 0x128). Gating on the
+     * wrong side was what cost Stage 5 most of its schedule; now each generation accepts its own. */
     if(irq != 0x00000001UL || gShimFwRev == 0)      gShimFwErr = paramErr;
-    else if(gShimFwRev <= 0x128)                    gShimFwErr = paramErr;
-    else                                            gShimFwErr = noErr;
+    else if(isV3)                                   gShimFwErr = (gShimFwRev <= 0x128) ? noErr : paramErr;
+    else                                            gShimFwErr = (gShimFwRev >  0x128) ? noErr : paramErr;
 
     if(haveSaved)
       (void)ExpMgrConfigWriteLong(&gBus.node,(LogicalAddress)SSB_BAR0_WIN,savedWin);
+}
+
+/* ★ k244: THE 8-2c RESULT, DECODED AND ON DISK BEFORE ANYTHING DOWNSTREAM TOUCHES THE CARD.
+ *
+ * The native path never narrated the firmware at all -- only the shim path's ApShimNarrateOpen did, after
+ * everything had returned, and its decode was v4-only. Then k243 stopped silently somewhere past the
+ * upload, and the one fact that splits that search in half sat unwritten in gShimFwRev: every step after
+ * this one DECLINES unless the firmware came up (which is why k239's log, whose v4 ucode never started on
+ * this card, ran to the end). So "did ucode4 start?" is now the first thing written after the upload,
+ * decoded for the generation that was loaded. Logging and one flush; no hardware access. */
+static void ApShimPCat2(Str255 L, unsigned long v) { if(v < 10UL) PCat(L,"0"); PCatDec(L,v); }
+
+static void ApShimSayFwResult(void)
+{
+    Str255 L;
+    UInt32 irq = gShimFwIrq, m = gShimFwMacctl;
+
+    Say("");
+    if(gShimFwErr == 1){ Say("  [8-2c] FIRMWARE: never attempted"); ApShimDumpRingToFile(); return; }
+    Say(gShimIsV3 ? "  [8-2c] FIRMWARE RESULT -- v3 (b43legacy ucode4 + pcm4), chosen for core rev <= 4"
+                  : "  [8-2c] FIRMWARE RESULT -- v4 (b43), chosen for core rev >= 5");
+    if(gShimFwCoreRev == 0 && irq == 0 && gShimFwRev == 0){
+        Say("    the upload did not run (core not up, window not selected, or the blob header was refused)");
+    } else {
+        Say1("    802.11 core rev read at the upload = ", gShimFwCoreRev);
+
+        SayH("    GEN_IRQ_REASON after PSM_RUN = ", irq, 8);
+        if(irq == 0x00000001UL)      Say("      = MAC_SUSPENDED alone: the microcode ran and reported ready");
+        else if(irq == 0)            Say("      = nothing raised: the microcode never signalled (did not run, or stalled)");
+        else if(irq == 0xFFFFFFFFUL) Say("      = all ones: the clear did not take, or the read failed on the backplane");
+        else {                       /* bit names: b43.h:532-553, identical in b43legacy.h:232-253 */
+            if(irq & 0x00000001UL) Say("      bit 0  MAC_SUSPENDED (ready) -- but not alone");
+            if(irq & 0x08000000UL) Say("      bit 27 UCODE_DEBUG -- the microcode raised a debug/panic event");
+            if(irq & 0x80000000UL) Say("      bit 31 TIMEOUT");
+            if(irq & 0x00000A00UL) Say("      bit 9 / 11 MAC_TXERR / PHY_TXERR");
+            if(irq & ~0x88000A01UL) SayH("      other bits = ", irq & ~0x88000A01UL, 8);
+        }
+        Say1("    10 ms waits before ready (100 = gave up after 1 s) = ", gShimFwPolls);
+
+        L[0]=0; PCat(L,"    ucode rev "); PCatDec(L,(unsigned long)gShimFwRev);
+        PCat(L," (0x"); PCatHex(L,(unsigned long)gShimFwRev,4); PCat(L,"), patch ");
+        PCatDec(L,(unsigned long)gShimFwPatch); PCat(L,", built 20");
+        ApShimPCat2(L,(gShimFwDate>>12)&0xFUL); PCat(L,"-"); ApShimPCat2(L,(gShimFwDate>>8)&0xFUL); PCat(L,"-");
+        ApShimPCat2(L,gShimFwDate&0xFFUL); PCat(L," "); ApShimPCat2(L,(gShimFwTime>>11)&0x1FUL); PCat(L,":");
+        ApShimPCat2(L,(gShimFwTime>>5)&0x3FUL); PCat(L,":"); ApShimPCat2(L,gShimFwTime&0x1FUL);
+        Out(L);
+        if(gShimFwRev == 0)
+            Say("      rev 0: nothing in SHM -- the microcode never got far enough to write its header");
+        else if(gShimIsV3)
+            Say(gShimFwRev <= 0x128 ? "      rev <= 0x128: v3 code, the RIGHT generation for this core (b43legacy's gate)"
+                                    : "      [!!] rev > 0x128: v4 code on a v3 core -- b43legacy refuses this");
+        else
+            Say(gShimFwRev >  0x128 ? "      rev > 0x128: v4 code, the right generation for this core (b43's gate)"
+                                    : "      [!!] rev <= 0x128: v3 code on a v4 core -- b43 refuses this");
+        SayH("    SHM 0x0040 = ", (unsigned long)gShimFwStat, 4);
+        Say(gShimIsV3 ? "      (raw: b43legacy defines no word here; in b43 it is UCODESTAT, 3 = suspended)"
+                      : (gShimFwStat == 3 ? "      = UCODESTAT 3, suspended: as it should be before the MAC is enabled"
+                                          : "      = UCODESTAT (0 invalid, 1 init, 2 active, 3 suspended, 4 asleep)"));
+
+        SayH("    MACCTL after the poll = ", m, 8);
+        L[0]=0; PCat(L,"      ");
+        PCat(L,(m & B43_MACCTL_PSM_RUN)     ? "PSM_RUN "    : "psm-stopped ");
+        PCat(L,(m & B43_MACCTL_PSM_JMP0)    ? "PSM_JMP0(!) " : "");
+        PCat(L,(m & B43_MACCTL_ENABLED)     ? "ENABLED "    : "mac-off ");
+        PCat(L,(m & B43_MACCTL_IHR_ENABLED) ? "IHR "        : "");
+        PCat(L,(m & B43_MACCTL_SHM_ENABLED) ? "SHM "        : "");
+        PCat(L,(m & B43_MACCTL_INFRA)       ? "INFRA "      : "");
+        PCat(L,(m & B43_MACCTL_GMODE)       ? "GMODE"       : "");
+        Out(L);
+    }
+    SayH("    firmware status = ", (unsigned long)gShimFwErr, 8);
+    Say(gShimFwErr == noErr ? "      noErr -> every chip_init step below RUNS on this card"
+                            : "      failed -> every step below DECLINES and touches nothing (k239's shape)");
+    ApShimDumpRingToFile();
 }
 
 /* ★★★ STAGE 8-2d-2b: THE DRIVER APPLIES THE INITVALS.
@@ -586,8 +1072,8 @@ static OSStatus gShimIvErr = 1;                   /* 1 = never attempted */
 static void ApShimApplyInitvals(void)
 {
     const unsigned char *iv, *bs;
-    UInt32 ivLen, bsLen, savedWin = 0;
-    int haveSaved, haveBs;
+    UInt32 ivLen, bsLen, savedWin = 0, coreRev;
+    int haveSaved, haveBs, isV3;
     Str255 L;
 
     if(gShimIvErr != 1) return;                   /* once per load */
@@ -606,14 +1092,9 @@ static void ApShimApplyInitvals(void)
       gShimIvErr = paramErr;
       return; }
 
-    if(!ApShimFwCheck(kApFwIv,kApFwIv_LEN,'i',&iv,&ivLen)){
-      Say("    [!!] the b0g0initvals5 blob failed its header check -- re-run embed-fw.sh");
-      gShimIvErr = paramErr;
-      return; }
-    gShimIvDeclared = ApBe32(kApFwIv+4);           /* an 'i' header declares a RECORD COUNT */
-    haveBs = ApShimFwCheck(kApFwBsIv,kApFwBsIv_LEN,'i',&bs,&bsLen);
-    if(haveBs) gShimBsDeclared = ApBe32(kApFwBsIv+4);
-
+    /* ⚠ Select the core FIRST: we need the core rev to pick the generation's initvals (coreRev read
+     * locally, like ApShimLoadFirmware -- gShimCoreRev is set later), and ApplyIvs writes core
+     * registers below 0x1000 anyway. */
     haveSaved = (ExpMgrConfigReadLong(&gBus.node,(LogicalAddress)SSB_BAR0_WIN,
                                       &savedWin) == noErr);
     if(SsbSelectCore(&gBus,(UInt32)gShimIdx80211) != noErr){
@@ -622,10 +1103,35 @@ static void ApShimApplyInitvals(void)
       if(haveSaved) (void)ExpMgrConfigWriteLong(&gBus.node,
                                                 (LogicalAddress)SSB_BAR0_WIN,savedWin);
       return; }
+    coreRev = IDHIGH_REV(ssb_r32(gBus.bar0,SSB_IDHIGH));
+    isV3    = (coreRev <= 4);
 
-    Say("    applying b0g0initvals5...");
+    /* rev<=4 (BCM4306/2): b0g0initvals2 and NO band-specific initvals (b43legacy returns NULL for
+     * rev 4). rev>=5: b0g0initvals5 + b0g0bsinitvals5, exactly as shipped. */
+    if(isV3){
+      if(!ApShimFwCheck(kApFwIvV3,kApFwIvV3_LEN,'i',&iv,&ivLen)){
+        Say("    [!!] the b0g0initvals2 (v3) blob failed its header check -- re-run embed-fw.sh");
+        gShimIvErr = paramErr;
+        if(haveSaved) (void)ExpMgrConfigWriteLong(&gBus.node,
+                                                  (LogicalAddress)SSB_BAR0_WIN,savedWin);
+        return; }
+      gShimIvDeclared = ApBe32(kApFwIvV3+4);        /* an 'i' header declares a RECORD COUNT */
+      haveBs = 0;                                   /* rev 4 loads no band-specific initvals */
+    } else {
+      if(!ApShimFwCheck(kApFwIv,kApFwIv_LEN,'i',&iv,&ivLen)){
+        Say("    [!!] the b0g0initvals5 blob failed its header check -- re-run embed-fw.sh");
+        gShimIvErr = paramErr;
+        if(haveSaved) (void)ExpMgrConfigWriteLong(&gBus.node,
+                                                  (LogicalAddress)SSB_BAR0_WIN,savedWin);
+        return; }
+      gShimIvDeclared = ApBe32(kApFwIv+4);          /* an 'i' header declares a RECORD COUNT */
+      haveBs = ApShimFwCheck(kApFwBsIv,kApFwBsIv_LEN,'i',&bs,&bsLen);
+      if(haveBs) gShimBsDeclared = ApBe32(kApFwBsIv+4);
+    }
+
+    Say(isV3 ? "    applying b0g0initvals2 (v3)..." : "    applying b0g0initvals5...");
     gShimIvApplied = ApplyIvs(iv, ivLen);
-    L[0]=0; PCat(L,"    b0g0initvals5   applied "); PCatDec(L,gShimIvApplied);
+    L[0]=0; PCat(L,isV3 ? "    b0g0initvals2   applied " : "    b0g0initvals5   applied "); PCatDec(L,gShimIvApplied);
     PCat(L," of ");                                 PCatDec(L,gShimIvDeclared);
     PCat(L," declared");                            Out(L);
 
@@ -635,6 +1141,8 @@ static void ApShimApplyInitvals(void)
       L[0]=0; PCat(L,"    b0g0bsinitvals5 applied "); PCatDec(L,gShimBsApplied);
       PCat(L," of ");                                 PCatDec(L,gShimBsDeclared);
       PCat(L," declared");                            Out(L);
+    } else if(isV3){
+      Say("    (no band-specific initvals for core rev 4 -- correct for b43legacy)");
     } else {
       Say("    ⚠ b0g0bsinitvals5 ABSENT from this build -- re-run embed-fw.sh"); }
 
@@ -648,7 +1156,7 @@ static void ApShimApplyInitvals(void)
      * hundred. */
     if(gShimIvApplied != gShimIvDeclared)                       gShimIvErr = paramErr;
     else if(haveBs && gShimBsApplied != gShimBsDeclared)        gShimIvErr = paramErr;
-    else if(!haveBs)                                            gShimIvErr = paramErr;
+    else if(!haveBs && !isV3)                                   gShimIvErr = paramErr;  /* v4 requires bsiv; v3 correctly has none */
     else                                                        gShimIvErr = noErr;
 
     Say(gShimIvErr == noErr ? "    [ok] both tables applied in full."
@@ -790,6 +1298,9 @@ static void ApShimRadioOn(void)
     Say("  [8-2d-3] switch_analog(1), then b43_software_rfkill(dev,false)");
     SwitchAnalog(1);
     RadioOn(1);                                 /* b43_gphy_op_get_default_chan() returns 1 */
+    if(gShimIsV3) SsbSpinUs(8000);              /* k244: b43legacy's radio_turn_on selects through
+                                                 * radio_selectchannel, which settles 8 ms (radio.c:1762);
+                                                 * PhyInitB5's radio writes come next */
     gShimRadioOn = 1;
     SayH("    PGACTL after the 0x8000 / 0xCC00 / 0x00C0 strobe = ",
          (unsigned long)PhyRead((UInt16)B43_PHY_PGACTL),4);
@@ -1001,6 +1512,22 @@ static void ApShimCoreInitMid(void)
     Say("  [8-2e2] b43_wireless_core_init's middle (k194) -- the statements this port had skipped");
     ShmWrite16Shared(B43_SHM_SH_WLCOREREV,(UInt16)gShimCoreRev);
 
+    /* ★ k244: b43legacy's host flags for this card, at b43legacy's position -- right after WLCOREREV
+     * (main.c:3291-3306): every G-PHY gets SYMW; rev 1 adds GDCW; a PACTRL board adds OFDMPABOOST. All
+     * three live in the low word (b43legacy.h:163-165). The v3 ucode reads them; b43's set for the 4306
+     * (none, k219) was written for the v4 ucode on a rev-2 PHY and stays as it is there. */
+    if(gShimIsV3){
+      UInt16 hlo=0,hmi=0,hhi=0, want=0x0002U;                          /* SYMW: every G-PHY */
+      if(gShimPhyRev == 1) want |= 0x0020U;                             /* GDCW: PHY rev 1 (ChipInitTail read it) */
+      if(gShimBoardFlags & B43_BFL_PACTRL) want |= 0x0040U;             /* OFDMPABOOST */
+      HfRead(&hlo,&hmi,&hhi);
+      hlo |= want;
+      HfWrite(hlo,hmi,hhi);
+      HfRead(&hlo,&hmi,&hhi);                     /* decode the read-back, never a bare write */
+      SayH("    [v3] host flags low word (SYMW 0x2, GDCW 0x20, OFDMPABOOST 0x40) = ",(unsigned long)hlo,4);
+      if((hlo & want) != want) bad++;
+    }
+
     /* b43 main.c:4882-4886: a host flag keyed on the B2050 radio revision, written here because b43
      * does its hf_read/hf_write right after WLCOREREV. The 4318 (radio rev 6) wants TSSI-based tx
      * power -- B43_HF_4318TSSI (bit 21 of the 48-bit host flags -> HOSTF2 bit 5). The 4306 (rev 2)
@@ -1025,13 +1552,20 @@ static void ApShimCoreInitMid(void)
     ShmWrite16Shared(B43_SHM_SH_LFFBLIM,2);
     for(i = 0; i < 8; i++) RateMemoryWrite(0x480UL,kOfdm[i]);  /* b43_rate_memory_init, G-PHY: OFDM... */
     for(i = 0; i < 4; i++) RateMemoryWrite(0x4C0UL,kCck[i]);   /* ...falls through to CCK */
-    ShmWrite16Shared(B43_SHM_SH_BEACPHYCTL,ctl);             /* b43_set_phytxctl_defaults */
-    ShmWrite16Shared(B43_SHM_SH_ACKCTSPHYCTL,ctl);
-    ShmWrite16Shared(B43_SHM_SH_PRPHYCTL,ctl);
+    /* ⚠ k244: b43_set_phytxctl_defaults and the PHYTYPE/PHYVER words are v4-only. b43legacy writes
+     *   neither: it only read-modify-writes the antenna field of the three PHY-control words
+     *   (MgmtFrameTxAntenna, already run in chip_init's tail), and SHM 0x0050/0x0052 are not PHY
+     *   type/version in its map at all. The whole-word value here is v4-encoded -- ANT01AUTO and a TX
+     *   power field the v3 word does not have -- and these are the words the ucode builds ACKs from. */
+    if(!gShimIsV3){
+      ShmWrite16Shared(B43_SHM_SH_BEACPHYCTL,ctl);           /* b43_set_phytxctl_defaults */
+      ShmWrite16Shared(B43_SHM_SH_ACKCTSPHYCTL,ctl);
+      ShmWrite16Shared(B43_SHM_SH_PRPHYCTL,ctl); }
     ShmWrite16Scratch(B43_SHM_SC_MINCONT,0xF);               /* not a B-PHY */
     ShmWrite16Scratch(B43_SHM_SC_MAXCONT,0x3FF);
-    ShmWrite16Shared(B43_SHM_SH_PHYTYPE,B43_PHYTYPE_G_K194);
-    ShmWrite16Shared(B43_SHM_SH_PHYVER,(UInt16)gShimPhyRev);
+    if(!gShimIsV3){
+      ShmWrite16Shared(B43_SHM_SH_PHYTYPE,B43_PHYTYPE_G_K194);
+      ShmWrite16Shared(B43_SHM_SH_PHYVER,(UInt16)gShimPhyRev); }
 
     /* ── read-backs, every one decoded (CLAUDE.md: a bare hex value is a question) ── */
     { UInt16 v;
@@ -1042,9 +1576,16 @@ static void ApShimCoreInitMid(void)
       v = ShmRead16Shared(B43_SHM_SH_LFFBLIM);   Say1("    long fb limit  = ",(unsigned long)v); if(v != 2) bad++;
       v = ShmRead16Scratch(B43_SHM_SC_MINCONT);  Say1("    CWmin (MINCONT)= ",(unsigned long)v); if(v != 0xF) bad++;
       v = ShmRead16Scratch(B43_SHM_SC_MAXCONT);  Say1("    CWmax (MAXCONT)= ",(unsigned long)v); if(v != 0x3FF) bad++;
-      v = ShmRead16Shared(B43_SHM_SH_PHYTYPE);   Say1("    PHYTYPE (2=G)  = ",(unsigned long)v); if(v != B43_PHYTYPE_G_K194) bad++;
-      v = ShmRead16Shared(B43_SHM_SH_PHYVER);    Say1("    PHYVER         = ",(unsigned long)v); if(v != (UInt16)gShimPhyRev) bad++;
-      v = ShmRead16Shared(B43_SHM_SH_ACKCTSPHYCTL); SayH("    ACK/CTS phyctl = ",(unsigned long)v,4); if(v != ctl) bad++;
+      if(!gShimIsV3){
+        v = ShmRead16Shared(B43_SHM_SH_PHYTYPE);   Say1("    PHYTYPE (2=G)  = ",(unsigned long)v); if(v != B43_PHYTYPE_G_K194) bad++;
+        v = ShmRead16Shared(B43_SHM_SH_PHYVER);    Say1("    PHYVER         = ",(unsigned long)v); if(v != (UInt16)gShimPhyRev) bad++;
+        v = ShmRead16Shared(B43_SHM_SH_ACKCTSPHYCTL); SayH("    ACK/CTS phyctl = ",(unsigned long)v,4); if(v != ctl) bad++;
+      } else {                                    /* v3: only the antenna field was written, by chip_init's tail */
+        v = ShmRead16Shared(B43_SHM_SH_ACKCTSPHYCTL); SayH("    [v3] ACK/CTS phyctl = ",(unsigned long)v,4);
+        Say(((v & 0x03C0U) == 0x0300U) ? "      antenna field = ANTLAST (0x0300), the v3 encoding"
+                                       : "      [!!] antenna field is NOT ANTLAST");
+        if((v & 0x03C0U) != 0x0300U) bad++;
+      }
       /* The rate entries: the copy's SOURCE comes from the initvals. If a source reads 0 the copy
        * carried nothing, and "no OFDM ACK entries" would still be the state -- so print both. */
       for(i = 0; i < 8; i++){
@@ -1167,9 +1708,116 @@ static OSStatus gShimDmaErr = 1;                /* 1 = never attempted */
 static void ApShimTxFree(void);
 static void ApShimTxArm(void);   /* re-arm before every post -- see the note at its definition */
 
+/* ★★★ k245: RX RING 3 -- THE v3 MICROCODE'S TX-STATUS CHANNEL (802.11 core rev <= 4 only).
+ *
+ * b43legacy builds it right after the RX ring, on DMA engine 3 (dma.c:814-819: "if (dev->dev->id.revision
+ * < 5) ... b43legacy_setup_dmaring(dev, 3, 0, type)"): an RX ring of 64 slots x 16 bytes, frame offset 0
+ * (dma.h:89/94/96, dma.c:673-675), serviced on DMA3_REASON RX_DONE (main.c:1358-1363). Each slot receives
+ * one struct b43legacy_hwtxstatus; ap_txstat3.h turns it into the XMITSTAT pair and ap_tx.h's ApTs3Pop
+ * reads it, for the join (DrainTxStatus) and for the ARF (ApShimDrainTxStatQuiet).
+ *
+ * ⚠ ALWAYS ARMED ON THIS CORE, AND FREE-RUNNING. The join's TX-prove and the ARF need the statuses -- and a
+ *   microcode with a status to post and nowhere to put it is k149's failure in another form (an unread
+ *   XMITSTAT FIFO stalled the fw4 transmitter after a few frames). RXINDEX one past the end keeps the engine
+ *   running for good -- the RX ring's measured setting since k25 -- so no status is ever held back.
+ *
+ * ⚠ ONE PAGE, allocated at task level only (DmaBlockAlloc = NewPtrSysClear + LockMemory, Open-only by
+ *   documentation; check-exec-level.py enforces it). Descriptors at 0..511, records at AP_TS3_RECOFF.
+ *   Freed with the other DMA blocks, and only once the engine reports DISABLED (ApShimQuiesceChecked). */
+#define AP_TS3_ENGINE   (B43_MMIO_DMA32_BASE0 + 3UL * 0x20UL)    /* DMA engine 3 = 0x260 */
+static DmaBlock gTs3Block;
+static UInt32   gTs3Phys = 0, gTs3ArmStat = 0, gTs3RingRb = 0, gTs3Arms = 0, gTs3ArmBad = 0;
+
+/* Arm (or re-arm) engine 3's receive channel on the page. The caller has the 802.11 core in the window.
+ * 1 = RXRING reads back what was written and the engine is not DISABLED (the RX ring's own oracle). */
+static int ApTs3Arm(void)
+{
+    UInt32 i, k, value, addrext;
+    int resetOk;
+    if(!gTs3Block.raw || !gTs3Rec) return 0;
+    gTs3Armed = 0;                                       /* the consumers stand down while it changes */
+    resetOk = DmaControllerRxReset(AP_TS3_ENGINE);
+    if(!resetOk){                                        /* RxRingArm's longer wait, for the same reason */
+      for(i = 0; i < 200; i++){
+        if((ssb_r32(gBus.bar0, AP_TS3_ENGINE + B43_DMA32_RXSTATUS) & B43_DMA32_RXSTATE)
+            == B43_DMA32_RXSTAT_DISABLED){ resetOk = 1; break; }
+        SsbSpinUs(1000); } }
+    for(i = 0; i < AP_TS3_SLOTS; i++){
+      UInt8 *rec = gTs3Rec + i * AP_TS3_BUFSZ;
+      for(k = 0; k < AP_TS3_BUFSZ; k++) rec[k] = 0;      /* cookie 0 = not yet written */
+      Op32FillDescriptor(gTs3Block.base, (int)i, (int)AP_TS3_SLOTS,
+                         gTs3Phys + AP_TS3_RECOFF + i * AP_TS3_BUFSZ, (UInt16)AP_TS3_BUFSZ); }
+    addrext = B43DmaAddressExt(gTs3Phys);
+    value  = ((UInt32)AP_TS3_FRAMEOFF << B43_DMA32_RXFROFF_SHIFT);
+    value |= B43_DMA32_RXENABLE;
+    value |= (addrext << B43_DMA32_RXADDREXT_SHIFT) & B43_DMA32_RXADDREXT_MASK;
+    DmaPublish();                                        /* descriptors and empty records before the engine */
+    ssb_w32(gBus.bar0, AP_TS3_ENGINE + B43_DMA32_RXCTL, value);
+    ssb_w32(gBus.bar0, AP_TS3_ENGINE + B43_DMA32_RXRING, B43DmaAddressLow(gTs3Phys));
+    ssb_w32(gBus.bar0, AP_TS3_ENGINE + B43_DMA32_RXINDEX, (UInt32)AP_TS3_SLOTS * B43_DMADESC32_BYTES);
+    gTs3Cursor  = 0;                                     /* a reset engine starts at descriptor 0 */
+    gTs3RingRb  = ssb_r32(gBus.bar0, AP_TS3_ENGINE + B43_DMA32_RXRING);
+    gTs3ArmStat = ssb_r32(gBus.bar0, AP_TS3_ENGINE + B43_DMA32_RXSTATUS);
+    gTs3Arms++;
+    if(!resetOk) gTs3ArmBad++;
+    if(gTs3RingRb != B43DmaAddressLow(gTs3Phys)
+       || (gTs3ArmStat & B43_DMA32_RXSTATE) == B43_DMA32_RXSTAT_DISABLED){ gTs3ArmBad++; return 0; }
+    gTs3Armed = 1;
+    return 1;
+}
+
+/* Stop engine 3 and zero its ring register -- the card must not keep the page's address. 1 = it reported
+ * DISABLED (or there is no ring). Register access: the caller has the 802.11 core selected. */
+static int ApTs3Stop(void)
+{
+    int ok;
+    gTs3Armed = 0;
+    if(!gTs3Block.raw || !gBus.bar0) return 1;
+    ok = DmaControllerRxReset(AP_TS3_ENGINE);
+    ssb_w32(gBus.bar0, AP_TS3_ENGINE + B43_DMA32_RXRING, 0);
+    return ok;
+}
+
+static void ApTs3Free(void)                              /* task level; only after ApTs3Stop */
+{
+    if(!gTs3Block.raw) return;
+    DmaBlockFree(&gTs3Block); gTs3Block.ok = 0;
+    gTs3Rec = 0; gTs3Armed = 0;
+}
+
+/* Once per load, from ApShimDmaInit (task level, 802.11 core selected), on the rev-4 core only. A failure is
+ * said and NOT fatal: the join still runs (the rev-4 auth gate only advises), but with no TX status the ARF
+ * has nothing to step down on, so the data rate is pinned to CCK 1 Mbps, the floor every frame of this
+ * project has been proven at. */
+static void ApTs3Init(void)
+{
+    Say("    [v3] RX ring 3 -- where this core's microcode posts TX status (b43legacy rx_ring3)");
+    if(!gTs3Block.raw){
+      if(!DmaBlockAlloc(&gTs3Block, K3_PAGE) || gTs3Block.physRun < K3_PAGE
+         || (gTs3Block.phys & (K3_PAGE - 1UL)) != 0 || !InWindow(gTs3Block.phys, K3_PAGE)){
+        Say("    [v3] [!!] ring 3: no usable page (allocation, contiguity, or the 1 GB DMA window).");
+        ApTs3Free();
+        gTxRateIdx = 0;
+        Say("         TX status will be UNKNOWN; the data rate is pinned to CCK 1 Mbps.");
+        return; }
+      gTs3Phys = gTs3Block.phys;
+      gTs3Rec  = gTs3Block.base + AP_TS3_RECOFF; }
+    if(ApTs3Arm()){
+      SayH("    [v3] ring 3 phys           = ", gTs3Phys, 8);
+      SayH("    [v3] ring 3 RXRING reads   = ", gTs3RingRb, 8);
+      SayH("    [v3] ring 3 RXSTATUS       = ", gTs3ArmStat, 8);
+      Say("    [v3] [ok] ring 3 armed: 64 slots x 16 bytes, free-running. TX status is readable.");
+    } else {
+      SayH("    [v3] [!!] ring 3 did NOT arm. RXRING reads = ", gTs3RingRb, 8);
+      SayH("         RXSTATUS = ", gTs3ArmStat, 8);
+      gTxRateIdx = 0;
+      Say("         TX status will be UNKNOWN; the data rate is pinned to CCK 1 Mbps."); }
+}
+
 static void ApShimDmaStop(void)
 {
     if(gShimDmaBase && gBus.bar0) (void)DmaControllerRxReset(gShimDmaBase);
+    (void)ApTs3Stop();               /* k245: ring 3 too (a no-op without one); a teardown path, best effort */
     gShimDmaArmed = 0;
 }
 
@@ -1179,6 +1827,7 @@ static void ApShimDmaFree(void)
     ApShimDmaStop();                 /* the engine must not hold these addresses */
     DmaBlockFree(&gShimRxRing);
     DmaBlockFree(&gShimRxPool);
+    ApTs3Free();                     /* k245 */
     ApShimTxFree();                  /* the TX blocks, defined with the TX code below */
     gShimDmaErr = 1;                 /* so a later Open may build a fresh ring */
 }
@@ -1286,6 +1935,10 @@ static void ApShimDmaInit(void)
      *   down covers the ordinary path; the explicit call covers the rest. */
     gShimRxStatFinal = gShimRxStatArmed;
 
+    /* ★ k245: b43legacy's order -- rx_ring0, then rx_ring3 on a core below rev 5 (dma.c:808-819). Only once
+     * the RX ring is good: a declined DMA init never reaches a transmit, so it never needs TX status. */
+    if(gShimIsV3 && gShimDmaErr == noErr) ApTs3Init();
+
     if(haveSaved)
       (void)ExpMgrConfigWriteLong(&gBus.node,(LogicalAddress)SSB_BAR0_WIN,savedWin);
 }
@@ -1337,7 +1990,15 @@ static void ApShimCoreInitTail(void)
     Say("");
     Say("  [8-2g] b43_wireless_core_init's remaining five statements");
 
-    QosInitDisabled();                                      /* [1] */
+    /* ⚠ k244: [1] and [5] are b43's, and on the rev-4 core (gShimIsV3) b43legacy does neither:
+     *   [1] QosInitDisabled read-modify-writes MMIO 0x688 (IFSCTL). b43legacy's qos_init opens with a
+     *       bare `return;` (xmit.c:640-644), so it never addresses 0x688 on any core.
+     *   [5] SecurityInit writes MMIO 0x43C (RCMTA_COUNT), which b43legacy writes only for core rev >= 5
+     *       (main.c:2392-2395), and clears 58 key slots plus SHM routing 4 -- which on this core is
+     *       b43legacy's SHM_HW (b43legacy.h:115), not RCMTA -- where rev 4 has 20 (main.c:2384).
+     *       b43legacy reads the key-table pointer and clears nothing; our crypto is software anyway. */
+    if(!gShimIsV3) QosInitDisabled();                       /* [1] */
+    else Say("    [v3] QoS init skipped (b43legacy: no-op; MMIO 0x688 never touched)");
     gShimPuDelay = SetSynthPuDelay();                       /* [2] */
     Say1("    SPUWKUP written = ",(unsigned long)gShimPuDelay);
 
@@ -1349,7 +2010,12 @@ static void ApShimCoreInitTail(void)
       { int i; for(i=0;i<6;i++){ if(i) PCat(L,":"); PCatHex(L,(unsigned long)gShimMac[i],2); } }
       Out(L); }
 
-    SecurityInit(&gShimKtp,&gShimNKeys);                    /* [5] */
+    if(!gShimIsV3) SecurityInit(&gShimKtp,&gShimNKeys);     /* [5] */
+    else {                                                   /* b43legacy_security_init: KTP only */
+      gKtp = (UInt32)ShmRead16Shared(B43_SHM_SH_KTP) * 2UL;  /* KTP is a WORD address */
+      gShimKtp = gKtp; gShimNKeys = 0;
+      Say("    [v3] security init = b43legacy's: key table pointer read; no RCMTA_COUNT, nothing cleared");
+    }
     Say1("    key table pointer = ",(unsigned long)gShimKtp);
     Say1("    key slots cleared = ",(unsigned long)gShimNKeys);
 
@@ -1376,8 +2042,20 @@ static void ApShimMacOn(void)
      * all. Level 2 adds PROMISC and KEEP_BAD and would make "we received something" nearly
      * unfalsifiable. Level 1 is the weakest setting that can possibly succeed, which is the one
      * an honest first receive test wants. */
-    gShimFilter = ApplyFilter(B43_MACCTL_BEACPROMISC);
+    /* ⚠ k244: ...except on a core rev <= 4, where ApplyFilter would clear the PROMISC that
+     *   AdjustOpmode set on purpose: "On old hardware the HW-MAC-address-filter doesn't work properly,
+     *   so always run promisc and filter it in software" (b43legacy main.c:2031-2035; b43 has the same
+     *   workaround). The data path already drops unicast that is not ours (ap_enet.h:148). */
+    gShimFilter = ApplyFilter(B43_MACCTL_BEACPROMISC | (gShimIsV3 ? B43_MACCTL_PROMISC : 0UL));
     SayH("    MACCTL after filter = ",gShimFilter,8);
+    if(gShimIsV3){
+      Say((gShimFilter & B43_MACCTL_PROMISC) ? "      [v3] PROMISC set (core rev <= 4: the hardware MAC filter is unreliable)"
+                                             : "      [!!] [v3] PROMISC did not stick");
+      /* k245: ring 3 is armed (or its failure was said) in 8-2f above; say which, so the join below reads right. */
+      Say(gTs3Armed ? "      [v3] TX status arrives on DMA ring 3 on this core; k245 armed it, so ACKs below are real answers."
+                    : "      [v3] TX status arrives on DMA ring 3, which did NOT arm (see 8-2f): \"ACKed = 0\" means UNKNOWN.");
+      Say("           Either way the join goes by the AP's responses: the auth gate only advises on this core.");
+    }
 
     MacEnable();
     gShimMacOn = 1; gShimMacEverOn = 1;
@@ -1434,7 +2112,8 @@ UInt32 AirPortShimQuiesce(void)
         (void)DmaControllerTxReset(gShimTxBase);
         ssb_w32(gBus.bar0,gShimTxBase+B43_DMA32_TXRING,0); }
       (void)DmaControllerRxReset(gShimDmaBase);
-      ssb_w32(gBus.bar0,gShimDmaBase+B43_DMA32_RXRING,0); }
+      ssb_w32(gBus.bar0,gShimDmaBase+B43_DMA32_RXRING,0);
+      (void)ApTs3Stop(); }          /* k245: ring 3 too -- cast away like the two resets above it */
     gShimDmaArmed = 0;
     gShimRxErr = 1;
     return 1;
@@ -1492,6 +2171,10 @@ static UInt32   gKnownCount = 0, gKnownLoadErr = 0, gKnownNoFile = 0;   /* snaps
 static UInt32   gShimTxRingReadback = 0;
 static SInt32   gShimTxSupp = -1;
 static OSStatus gShimTxErr = 1;                 /* 1 = never attempted */
+/* ★ k245: gShimTxErr folds two facts into one word -- "the TX ring is armed" and "the probe was ACKed" --
+ * and only the second resets. These keep them apart: gShimTxRingOk = ApShimTxInit armed the ring (the
+ * only thing that makes a post safe); gShimTxStatSeen = the last probe's own status arrived. */
+static int      gShimTxRingOk = 0, gShimTxStatSeen = 0;
 
 /* ★★★ k195: THE DATA-PATH TX RING -- positions, buffers and reclaim live in ap_txring.h (host-tested
  * by txring_test.c). The JOIN keeps gShimTxHdr/gShimTxFrm and its one-frame reset idiom (ApShimTxArm,
@@ -1648,6 +2331,7 @@ static void ApShimTxInit(void)
      * gShimFwErr and it applies just as much here.
      *   1 = never attempted   2 = armed, waiting for TxProbe   noErr = ACKed   else = failed */
     gShimTxErr = 2;
+    gShimTxRingOk = 1;                            /* k245: survives a failed probe; only ApShimTxFree clears it */
     Say("    [ok] TX ring armed. The frame itself waits for the app to call TxProbe.");
 
     if(haveSaved)
@@ -1711,7 +2395,7 @@ UInt32 AirPortShimTxProbe(void)
     Say1("    frame length = ",(unsigned long)flen);
     DmaPublish();
     PostTxFrameAt(gShimTxBase,gShimTxRing.base,0,
-                  gShimTxHdrPhys,(UInt16)TXH_SIZE_351,gShimTxFrmPhys,flen);
+                  gShimTxHdrPhys,TXH_SIZE_LIVE,gShimTxFrmPhys,flen);
 
     /* ★ THE ORACLE. An ACK means a real AP received this frame and answered within a SIFS. */
     gShimTxAcked = DrainTxStatus(0xC000,600);
@@ -1720,6 +2404,14 @@ UInt32 AirPortShimTxProbe(void)
     Say1("    TX status reports seen = ",(unsigned long)gTxStatCount);
     Say1("    ACKED                  = ",(unsigned long)gShimTxAcked);
     Say1("    supp_reason            = ",(unsigned long)(gShimTxSupp < 0 ? 0 : gShimTxSupp));
+    /* ★ k245: on the rev-4 core, say WHERE the answer came from and whether there was one. k244 printed
+     * "ACKED = 0" with no status behind it, which reads like a refusal and was really silence. */
+    gShimTxStatSeen = gTxStatSawWanted;
+    if(gShimIsV3){
+      Say1("    [v3] status source = RX ring 3; armed (1 = yes) = ",(unsigned long)gTs3Armed);
+      Say1("    [v3] ring-3 records popped so far             = ",(unsigned long)gTs3Popped);
+      Say(gShimTxStatSeen ? "    [v3] the probe's own status ARRIVED: its ACK bit above is a real answer."
+                          : "    [v3] NO status for the probe: ACKED 0 means UNKNOWN here, not a refusal."); }
     gShimTxErr = gShimTxAcked ? noErr : paramErr;
     Say(gShimTxAcked ? "    [ok] ★ AN ACCESS POINT ACKNOWLEDGED OUR FRAME."
                      : "    [!!] no ACK -- see the status decode above.");
@@ -1748,6 +2440,7 @@ static void ApShimTxFree(void)
     DmaBlockFree(&gShimTxPool);
     DmaBlockFree(&gTxrPool); gTxrReady = 0; gTxrUp = 0;       /* k195: the data-path ring's buffers */
     gShimTxErr = 1; gShimHaveBssid = 0;
+    gShimTxRingOk = 0;                            /* k245: the ring is gone -- nothing may post to it */
 }
 
 /* ⚠⚠ RE-ARM BEFORE EVERY POST, AND k79 LOST A RUN TO NOT DOING IT.
@@ -2059,11 +2752,22 @@ UInt32 AirPortShimAuth(void)
     UInt32 ams = 0; int aseen = 0;
 
     if(gShimAuthErr != 1) return 0;             /* once per load */
+    /* ★★ k245: ON THE REV-4 CORE THE GATE ADVISES; IT DOES NOT DECIDE. k244's comments already said "the join
+     * goes by the AP's responses" there, but this gate still refused every attempt, on a probe whose status
+     * (ring 3, unread) could not arrive. The AP's authentication response is the stronger proof anyway: it is
+     * addressed to us, so the AP heard our request. The fw4 path is unchanged, and no core posts without an
+     * armed TX ring (gShimTxRingOk). */
     if(gShimTxErr != noErr){
-      Say("");
-      Say("  [8-3b] AUTH DECLINED -- the transmitter is not proven.");
-      Say("    ⚠ Read the 8-3a result above; this is downstream of it.");
-      gShimAuthErr = paramErr; return 0; }
+      if(gShimIsV3 && gShimTxRingOk){
+        Say("");
+        Say("  [8-3b] [v3] the probe was not confirmed -- authenticating anyway. On this core the AP's");
+        Say(gShimTxStatSeen ? "        answer decides; the probe's status above said it was not ACKed."
+                            : "        answer decides; no status for the probe arrived (UNKNOWN, not refused).");
+      } else {
+        Say("");
+        Say("  [8-3b] AUTH DECLINED -- the transmitter is not proven.");
+        Say("    ⚠ Read the 8-3a result above; this is downstream of it.");
+        gShimAuthErr = paramErr; return 0; } }
 
     Say("");
     Say("  [8-3b] AUTHENTICATION -- open system, sequence 1");
@@ -2099,7 +2803,7 @@ UInt32 AirPortShimAuth(void)
       Say1("    [8-31] deauth first, to clear stale AP state. length = ",(unsigned long)dlen);
       DmaPublish();
       PostTxFrameAt(gShimTxBase,gShimTxRing.base,0,
-                    gShimTxHdrPhys,(UInt16)TXH_SIZE_351,gShimTxFrmPhys,dlen);
+                    gShimTxHdrPhys,TXH_SIZE_LIVE,gShimTxFrmPhys,dlen);
       /* Drain our own status so the deauth's entry cannot be mistaken for the auth request's
        * a moment later -- k90 lost a run to exactly that confusion, reporting a stale status
        * as the current frame's ACK. The 50 ms doubles as the AP's settle time. */
@@ -2114,7 +2818,7 @@ UInt32 AirPortShimAuth(void)
     Say1("    auth request length = ",(unsigned long)flen);
     DmaPublish();
     PostTxFrameAt(gShimTxBase,gShimTxRing.base,0,
-                  gShimTxHdrPhys,(UInt16)TXH_SIZE_351,gShimTxFrmPhys,flen);
+                  gShimTxHdrPhys,TXH_SIZE_LIVE,gShimTxFrmPhys,flen);
 
     gShimAuthAcked = DrainTxStatus(0xC001,600);
     Say1("    the AP ACKed our auth request = ",(unsigned long)gShimAuthAcked);
@@ -2140,6 +2844,12 @@ UInt32 AirPortShimAuth(void)
       Say1("    ★★★ AUTH RESPONSE after ms = ",(unsigned long)ams);
       Say1("        frames walked while waiting = ",(unsigned long)aseen);
       ApShimSayRxRing("8-3b auth");
+      /* ★ k245: an authentication frame from the target, addressed to us, means the AP heard our request --
+       * proof of the transmitter whatever its status said. Only reachable unproven on the rev-4 core (the
+       * fw4 path never gets here without an ACKed probe), so the fw4 path is unchanged. */
+      if(gShimTxErr != noErr && gShimTxRingOk){
+        gShimTxErr = noErr;
+        Say("        [v3] the AP answered our request: the transmitter is PROVEN by that answer."); }
       SayH("        algorithm = ",(unsigned long)gShimAuthAlg,4);
       SayH("        sequence  = ",(unsigned long)gShimAuthSeq,4);
       SayH("        status    = ",(unsigned long)gShimAuthStatus,4);
@@ -2249,7 +2959,7 @@ UInt32 AirPortShimAssoc(void)
     ApShimTxArm();
     DmaPublish();
     PostTxFrameAt(gShimTxBase,gShimTxRing.base,0,
-                  gShimTxHdrPhys,(UInt16)TXH_SIZE_351,gShimTxFrmPhys,blen);
+                  gShimTxHdrPhys,TXH_SIZE_LIVE,gShimTxFrmPhys,blen);
 
     gShimAssocAcked = DrainTxStatus(0xC020,600);
     Say1("    the AP ACKed our assoc request = ",(unsigned long)gShimAssocAcked);
@@ -2423,7 +3133,7 @@ static void ApShimSendM2(void)
     ApShimTxArm();
     DmaPublish();
     PostTxFrameAt(gShimTxBase,gShimTxRing.base,0,
-                  gShimTxHdrPhys,(UInt16)TXH_SIZE_351,gShimTxFrmPhys,m2len);
+                  gShimTxHdrPhys,TXH_SIZE_LIVE,gShimTxFrmPhys,m2len);
     gShimM2Sent = 1;
     gShimM2Posts++;
     acked = DrainTxStatus(0xC030,600);
@@ -2726,7 +3436,7 @@ UInt32 AirPortShimHandshake(void)
       ApShimTxArm();
       DmaPublish();
       PostTxFrameAt(gShimTxBase,gShimTxRing.base,0,
-                    gShimTxHdrPhys,(UInt16)TXH_SIZE_351,gShimTxFrmPhys,m4len);
+                    gShimTxHdrPhys,TXH_SIZE_LIVE,gShimTxFrmPhys,m4len);
       gShimM4Sent = 1;
       Say("    [ok] ★★★★★★ THE FOUR-WAY HANDSHAKE COMPLETED.");
       /* k208: message 3's replay counter is the floor every group renewal must be above. */
@@ -3506,6 +4216,29 @@ static UInt32 ApShimPumpLocked(UInt32 maxFrames)
 #define B43_DMAIRQ_RX_DONE          0x00010000UL
 #define B43_DMA0_REASON_MASK        0x0001FC00UL
 
+/* ★ k244: THE OTHER FIVE DMA REASONS, ON THE REV-4 CORE. GEN bit 15 (B43_IRQ_DMA) is the SUMMARY of all six
+ * engines, but the ISR acks only DMA0. On the 4306/3 and 4318 only engine 0 ever raises anything, so that
+ * held. On a core rev < 5 the v3 microcode posts TX status through DMA ring 3 (b43legacy dma.c), which this
+ * driver never arms, and ChipInitTail unmasks error bits on engines 1-5 (DMA3's mask even includes RX_DONE).
+ * One pending engine-1..5 reason would then keep the summary asserted forever: the ISR acks GEN and DMA0,
+ * masks, queues the secondary; the secondary unmasks; the line re-asserts at once -- a ping-pong in which
+ * task level never runs and nothing is logged. b43legacy acks all six (main.c:1436-1453 read them with these
+ * masks; interrupt_ack writes them back). MMIO only, so it is safe at hardware-interrupt level. The counter
+ * is the evidence for the TX-status ring: a DMA3 reason here means the ucode is trying to use it. */
+static const UInt32 kDmaReasonReg[5]  = { 0x028UL, 0x030UL, 0x038UL, 0x040UL, 0x048UL };   /* DMA1..DMA5 */
+static const UInt32 kDmaReasonMask[5] = { 0x0000DC00UL, 0x0000DC00UL, 0x0001DC00UL, 0x0000DC00UL, 0x0000DC00UL };
+static UInt32 gIrqDmaOther = 0, gIrqDmaOtherLast = 0;      /* last = engine in bits 31-28, reason below */
+static void ApShimAckDma1to5(int stale)
+{
+    int k;
+    for(k = 0; k < 5; k++){
+        UInt32 r;
+        if(stale){ ssb_w32(gBus.bar0, kDmaReasonReg[k], 0xFFFFFFFFUL); continue; }   /* before arming */
+        r = ssb_r32(gBus.bar0, kDmaReasonReg[k]) & kDmaReasonMask[k];
+        if(r){ ssb_w32(gBus.bar0, kDmaReasonReg[k], r);                              /* RW1C */
+               gIrqDmaOther++; gIrqDmaOtherLast = ((UInt32)(k + 1) << 28) | r; } }
+}
+
 static int      gIrqArmed = 0;
 static int      gIrqInstalled = 0;
 static InterruptSetID        gIstSet = 0;
@@ -3721,6 +4454,25 @@ static int ApShimWindowIsOurs(void)
 static void ApShimDrainTxStatQuiet(void)
 {
     int guard;
+    /* ⚠ k244: not on the rev-4 core. There the v3 microcode reports TX status through DMA ring 3, not the
+     *   XMITSTAT FIFO, and b43legacy's own drain refuses to touch XMITSTAT below rev 5 (main.c:737-738).
+     *   This runs on EVERY secondary interrupt, so if that register is not backed on rev 4 the first beacon
+     *   after arming would fault here, at interrupt level, with nothing logged.
+     * ★ k245: so on that core it drains RING 3 instead -- b43legacy's own route (DMA3 RX_DONE -> dma_rx on
+     *   rx_ring3 -> handle_hwtxstatus, main.c:1358-1363, dma.c:1235-1251). Memory reads only (ApTs3Pop never
+     *   touches a register), the cursor's record at a time, bounded like the FIFO drain -- and the ARF gets
+     *   the same XMITSTAT_0 word it has always voted on. The primary already acked DMA3's reason. */
+    if(gShimIsV3){
+        UInt32 v0, v1;
+        for(guard = 0; guard < 64 && ApTs3Pop(&v0, &v1, 0); guard++){
+            gTs3PoppedIsr++;
+            gTxStatIsrDrained++;
+            if(v0 & 0x00000002UL) gTxStatIsrAcked++;
+            ApTxRateFeedback(v0);
+        }
+        if((UInt32)guard > gTxStatFireMax) gTxStatFireMax = (UInt32)guard;
+        return;
+    }
     for(guard = 0; guard < 64; guard++){
         UInt32 v0 = ssb_r32(gBus.bar0, B43_MMIO_XMITSTAT_0);
         if(!(v0 & 0x00000001UL)) break;                    /* nothing pending */
@@ -3833,6 +4585,7 @@ static InterruptMemberNumber ApShimIsr(InterruptSetMember m, void *refCon, UInt3
     /* ACK, in b43's order: the general reason first, then the DMA reason. Both are RW1C. */
     ssb_w32(gBus.bar0, B43_MMIO_GEN_IRQ_REASON, reason);
     ssb_w32(gBus.bar0, B43_MMIO_DMA0_REASON,    dma0);
+    if(gShimIsV3) ApShimAckDma1to5(0);           /* k244: engines 1-5 too, on the rev-4 core (see above) */
     /* Silence the device until the secondary has drained. Without this a level-triggered line
      * re-asserts the instant we return and the machine livelocks in the ISR. */
     ssb_w32(gBus.bar0, B43_MMIO_GEN_IRQ_MASK, 0);
@@ -3921,6 +4674,7 @@ static int ApShimIrqEnable(void)
      * unhandled level interrupt is a livelock, not a missed feature. */
     ssb_w32(gBus.bar0, B43_MMIO_GEN_IRQ_REASON, 0xFFFFFFFFUL);
     ssb_w32(gBus.bar0, B43_MMIO_DMA0_REASON,    0xFFFFFFFFUL);
+    if(gShimIsV3) ApShimAckDma1to5(1);           /* k244: and engines 1-5 on the rev-4 core */
     gIrqMaskWanted = B43_IRQ_DMA;
     gIrqArmed = 1;
     ssb_w32(gBus.bar0, B43_MMIO_GEN_IRQ_MASK, gIrqMaskWanted);
@@ -4011,6 +4765,7 @@ static void ApShimIrqResume(void)
     if(!ApShimWindowIsOurs()){ gIrqResumeRefused++; return; }
     ssb_w32(gBus.bar0, B43_MMIO_GEN_IRQ_REASON, 0xFFFFFFFFUL);
     ssb_w32(gBus.bar0, B43_MMIO_DMA0_REASON,    0xFFFFFFFFUL);
+    if(gShimIsV3) ApShimAckDma1to5(1);           /* k244: and engines 1-5 on the rev-4 core */
     gIrqArmed = 1;
     ssb_w32(gBus.bar0, B43_MMIO_GEN_IRQ_MASK, gIrqMaskWanted);
     gIrqResumes++;
@@ -4257,7 +5012,7 @@ static OSStatus ApShimTxCore(const UInt8 *eth, UInt32 ethLen, int *isDhcpOut, co
      * 0/1: k79's fix for "posting slot 0 twice writes the same TXINDEX", which a ring answers by
      * never writing the same TXINDEX twice. The engine keeps running; nothing is reset per frame. */
     Op32FillDescriptorFull(gShimTxRing.base,(int)ApTxrHdrDesc(txPos),(int)AP_TXR_DESCS,
-                           gTxrHdrPhys[txBuf],(UInt16)TXH_SIZE_351,1,0,0);
+                           gTxrHdrPhys[txBuf],TXH_SIZE_LIVE,1,0,0);
     Op32FillDescriptorFull(gShimTxRing.base,(int)ApTxrHdrDesc(txPos) + 1,(int)AP_TXR_DESCS,
                            gTxrFrmPhys[txBuf],(UInt16)encLen,0,1,1);
     ApTxDoorbellBarrier();            /* txhdr, frame and both descriptors visible before the index */
@@ -4897,6 +5652,18 @@ static int ApShimEnsureRxLive(void)
       }
     }
 
+    /* ★ k245: AND RING 3 ON THE REV-4 CORE -- a join without it transmits blind, which is k244. The RX ring's
+     * own test: re-arm only when the engine is not ACTIVE, so a good boot is never disturbed. Every caller
+     * runs with the card's interrupt quiesced (the boot join is before ArmIrq; the rejoins quiesce first),
+     * and ApTs3Arm clears gTs3Armed before it touches anything, so the pump cannot read a half-armed ring. */
+    if(gShimIsV3 && gTs3Block.raw){
+      UInt32 s3 = ssb_r32(gBus.bar0, AP_TS3_ENGINE + B43_DMA32_RXSTATUS);
+      if(!gTs3Armed || (s3 & B43_DMA32_RXSTATE) != B43_DMA32_RXSTAT_ACTIVE){
+        SayH("  [k245] ring 3 not active before the join -- RXSTATUS = ", (unsigned long)s3, 8);
+        if(ApTs3Arm()) SayH("         re-armed and it TOOK -- RXSTATUS now = ", (unsigned long)gTs3ArmStat, 8);
+        else           SayH("         ⚠ re-arm did NOT take -- RXSTATUS = ", (unsigned long)gTs3ArmStat, 8); }
+    }
+
     if(haveSaved) (void)ExpMgrConfigWriteLong(&gBus.node,(LogicalAddress)SSB_BAR0_WIN,savedWin);
     return live;
 }
@@ -5081,6 +5848,14 @@ static void ApShimJoinReset(void)
      * PMK. The PTK is re-derived each handshake from the fresh ANonce anyway; clear its flag for the same
      * reason. The home-survey log now also prints which network each PMK was loaded for (AirPortShimPrepPmk). */
     gShimPmkReady = 0; gShimPtkReady = 0;
+    /* ⛔ k245: AND THE PROBE'S VERDICT, WHICH WAS THE ONE LATCH THIS FUNCTION MISSED. AirPortShimTxProbe runs
+     * only while gShimTxErr == 2 ("armed") and sets it to noErr or paramErr; nothing ever re-armed it. So ONE
+     * unacknowledged probe -- the first of the boot -- refused every later attempt for the rest of the boot:
+     * attempts 2 and 3, every link-watch rejoin, every join the panel asked for. That is the tester's k244 log
+     * exactly (one "[8-3a] transmitting", then "AUTH DECLINED" with no transmit at all), and why the panel
+     * span forever. A proven transmitter stays proven (noErr is left alone, as before); an unproven one
+     * gets a fresh probe, provided the ring it posts to is still armed. Guards must not latch. */
+    if(gShimTxRingOk && gShimTxErr != noErr) gShimTxErr = 2;
 }
 
 static void ApShimJoin(void)
@@ -5121,7 +5896,9 @@ static void ApShimJoin(void)
  *   and with the link down the AppleShare client's requests to the Pi sit until they time out. A
  *   synchronous write to the boot disk queued behind them would freeze the Finder -- whose thread this
  *   is -- for that long, and delay the rejoin that would unstick them. Lines stay in the ring and reach
- *   the disk on the first body after the rejoin. */
+ *   the disk on the first body after the rejoin.
+ *   ★ k245 EXCEPTION: on the first load of a boot with the link never up, no share can be mounted over it,
+ *   so the hold is lifted there -- see ApLinkMaybeFlush. */
 static void ApShimDumpRingToFile(void);   /* below: guarded, and appends since k204 */
 static int  ApShimLogHasNew(void);        /* below */
 static ApLink gLink;                      /* ⚠ TASK LEVEL ONLY: the body is its sole writer */
@@ -5130,6 +5907,7 @@ static UInt32 gLinkLatMaxUs = 0, gLinkBodyMaxUs = 0, gLinkRejoinMaxUs = 0, gLink
 static UInt32 gLinkLastHbTick = 0, gLinkLastFlushTick = 0;
 static UInt32 gLinkHbBcn = 0, gLinkHbRx = 0, gLinkHbTx = 0;
 static UInt32 gLinkEvtLost = 0, gLinkFlushHeld = 0;
+static int    gLinkEverUp = 0;   /* k245: the link has been up at least once in this load (ApLinkMaybeFlush) */
 #define AP_LINK_HB_UP_TICKS    120u   /* a status line every 30 s while up ... */
 #define AP_LINK_HB_DOWN_TICKS   40u   /* ... every 10 s while down */
 #define AP_LINK_FLUSH_TICKS     40u   /* new lines reach the disk within 10 s, at once after an event */
@@ -5431,7 +6209,7 @@ static void ApShimTxNull(int pm)
     GenerateTxHdr351(gShimTxHdr, gShimTxFrm, n, gShimChannel, 0xC00F, AP_TX_ANT, 1);
     ApShimTxArm();
     DmaPublish();
-    PostTxFrameAt(gShimTxBase, gShimTxRing.base, 0, gShimTxHdrPhys, (UInt16)TXH_SIZE_351, gShimTxFrmPhys, n);
+    PostTxFrameAt(gShimTxBase, gShimTxRing.base, 0, gShimTxHdrPhys, TXH_SIZE_LIVE, gShimTxFrmPhys, n);
     (void)DrainTxStatus(0xC00F, 50);
 }
 
@@ -5621,6 +6399,7 @@ static int ApLinkRejoinOnce(void)
         gStatReset = 1;                  /* k205: the signal average starts afresh on the new association */
         gLinkLastBcnTick = gLinkTick; gLinkBcnSeen = 1;   /* the join just heard the AP */
         gLinkTxBlocked = 0;
+        gLinkEverUp = 1;                 /* k245: from here a share may be mounted over us -- hold flushes while down */
         if(gOtmNativeMode && gOtmTxWaiting) ApOtmScheduleRx();   /* wake the held write queues */
         /* k215: if this landed on a DIFFERENT network than the one OT last knew, tell OT the network changed so
          * it renews DHCP for it -- without this, a switch kept the first network's IP and the second had no LAN.
@@ -5700,7 +6479,7 @@ static int ApShimTxGoodbye(void)
     GenerateTxHdr351(gShimTxHdr, gShimTxFrm, dlen, gShimChannel, 0xC00E, AP_TX_ANT, 1);
     ApShimTxArm();
     DmaPublish();
-    PostTxFrameAt(gShimTxBase, gShimTxRing.base, 0, gShimTxHdrPhys, (UInt16)TXH_SIZE_351, gShimTxFrmPhys, dlen);
+    PostTxFrameAt(gShimTxBase, gShimTxRing.base, 0, gShimTxHdrPhys, TXH_SIZE_LIVE, gShimTxFrmPhys, dlen);
     return DrainTxStatus(0xC00E, 50);
 }
 
@@ -5875,13 +6654,39 @@ static void ApLinkHeartbeat(UInt32 now)
       }
       Out(L);
     }
+    /* ★ k245: on the rev-4 core, ring 3's own counters -- memory reads only, like the line above. popped =
+     * statuses read (isr = by the interrupt pump), acked = of those, the AP ACKed; skipped = found past an
+     * empty record (cursor drift); arms/bad = ApTs3Arm calls and failures. Climbing popped with a climbing
+     * tx count is the proof the v3 microcode is reporting, and acked/popped is the link's real ACK rate. */
+    if(gShimIsV3){
+      L[0] = 0; PCat(L, "  [ts3] armed "); PCatDec(L, (unsigned long)gTs3Armed);
+      PCat(L, "  popped "); PCatDec(L, (unsigned long)gTs3Popped);
+      PCat(L, " (isr "); PCatDec(L, (unsigned long)gTs3PoppedIsr); PCat(L, ")");
+      PCat(L, "  acked "); PCatDec(L, (unsigned long)gTs3Acked);
+      PCat(L, "  skipped "); PCatDec(L, (unsigned long)gTs3Skipped);
+      PCat(L, "  arms "); PCatDec(L, (unsigned long)gTs3Arms);
+      PCat(L, "/bad "); PCatDec(L, (unsigned long)gTs3ArmBad);
+      PCat(L, "  last 0x"); PCatHex(L, (unsigned long)gTs3LastV0, 8);
+      Out(L);
+    }
     gLinkHbBcn = bcn; gLinkHbRx = rx; gLinkHbTx = tx; gLinkLastHbTick = now;
 }
 
+/* ★ k245: THE ONE CASE WHERE A FLUSH WHILE DOWN IS SAFE -- AND IT IS THE CASE A TESTER IS IN.
+ *
+ * k204 holds the log while the link is down because an AppleShare volume MOUNTED OVER THIS LINK blocks the
+ * File Manager until it times out, and a synchronous write queued behind it would freeze the Finder. But
+ * that needs a volume mounted over this link, which needs the link to have been UP. On the first load of a
+ * boot (gApLife->loads == 1) with the link never up in it, no such volume can exist -- so the hold protects
+ * nothing and costs everything: the tester's k244 log ended at "link DOWN at start", and every rejoin after it sat
+ * in RAM, unread. Kept for the cases it was written for: the link was up this load (a share may be mounted),
+ * or this is a reload after sleep (one may be left from before it), or there is no lifecycle block to ask. */
 static void ApLinkMaybeFlush(int event)
 {
+    if(!gLinkTxBlocked) gLinkEverUp = 1;
     if(!ApShimLogHasNew()) return;
-    if(gLinkTxBlocked){ gLinkFlushHeld++; return; }        /* see the block above: never behind AppleShare */
+    if(gLinkTxBlocked && (gLinkEverUp || !gApLife || gApLife->loads > 1)){
+        gLinkFlushHeld++; return; }                        /* see the block above: never behind AppleShare */
     if(!event && ApLinkAge(gLinkTick, gLinkLastFlushTick) < AP_LINK_FLUSH_TICKS) return;
     ApShimDumpRingToFile();
     gLinkLastFlushTick = gLinkTick;
@@ -5993,7 +6798,7 @@ static void ApLinkStart(int joined)
      * joined implies a target (the boot join found one), so the ternary order is consistent. */
     ApStatIdentity(joined ? kApLinkUp : (gHaveTarget ? kApLinkSearching : kApLinkIdle));
     gLinkUpFlag = joined;
-    if(joined){ gLinkLastBcnTick = gLinkTick; gLinkBcnSeen = 1; }
+    if(joined){ gLinkLastBcnTick = gLinkTick; gLinkBcnSeen = 1; gLinkEverUp = 1; }   /* k245: see ApLinkMaybeFlush */
     gLinkTxBlocked = !joined;
     gLinkLastHbTick = gLinkTick; gLinkLastFlushTick = gLinkTick; gLinkLastPostTick = gLinkTick;
     ApLinkArmTimer();
@@ -6233,8 +7038,12 @@ static void ApShimDumpRingToFile(void)
     if(gLogBegun && n <= gLogFlushedN) return;          /* nothing new */
     (void)apLogSpec("\pAirPort Driver Log", &sp);     /* k190: always the System Folder */
     if(!gLogBegun){
-        (void)FSpDelete(&sp);
-        if(FSpCreate(&sp, 'ttxt', 'TEXT', 0) != noErr) return;
+        /* k240: only the boot's FIRST load starts the file. A reload -- every wake from sleep now -- appends,
+         * so the session before the sleep stays in the log the wake is read against (lifecycle block). */
+        OSErr ce;
+        if(!gApLife || gApLife->loads <= 1) (void)FSpDelete(&sp);
+        ce = FSpCreate(&sp, 'ttxt', 'TEXT', 0);
+        if(ce != noErr && ce != dupFNErr) return;
         gLogFlushedN = 0;
     }
     e = FSpOpenDF(&sp, fsRdWrPerm, &ref);
@@ -6732,10 +7541,13 @@ static void ApShimNarrateOpen(void)
     /* ⚠ b43 rejects rev <= 0x128 outright, and Stage 5-4 was stuck for weeks on a v3 blob that
      * passed every upload check and then read our 106-byte txhdr as its own 82-byte layout. The
      * threshold is decoded HERE, at the point of reading, rather than left as a number for
-     * whoever reads the log to remember -- see "never log a status register as a bare number". */
+     * whoever reads the log to remember -- see "never log a status register as a bare number".
+     * ⚠ k244: and decoded for the generation that was LOADED. This line was v4-only, so on a v3 card it
+     *   would have printed "[!!] ... b43 would reject this" for exactly the rev the v3 gate accepts.
+     *   gShimFwErr == noErr already means the generation-aware gate passed; the line just names it. */
     if(gShimFwErr == noErr)
-        Say(gShimFwRev > 0x128 ? "  [8-2c] rev is ABOVE b43's 0x128 floor -- usable"
-                               : "  [8-2c] [!!] rev is AT OR BELOW 0x128 -- b43 would reject this");
+        Say(gShimIsV3 ? "  [8-2c] rev is AT OR BELOW 0x128 -- v3, b43legacy's generation, usable on this core"
+                      : "  [8-2c] rev is ABOVE b43's 0x128 floor -- usable");
 
     Say1("=== end of narration, Open #", (unsigned long)gShimOpenSeq);
 }
@@ -7219,6 +8031,10 @@ static void ApShimEnsurePowerAndLog(void)
     SayH("    gBus.bar0Size = ", (unsigned long)gBus.bar0Size, 8);
     Say1("    FindCard MACok= ", (unsigned long)gShimMacOk);
     SayH("    gShimMapErr   = ", (unsigned long)(long)gShimMapErr, 8);
+    /* k240: below this, the command register and PMCSR are WRITTEN. Not for a card the acquisition refused:
+     * memory decode on a BAR that lost its address would make the card answer at bus address 0, and a CardBus
+     * card's config belongs to Card Services. The acquisition record above already says what it found. */
+    if(gShimMapErr != noErr){ Say("    (k240) the card was not acquired -- its config is left exactly as found"); return; }
     /* 8-78 k184: backplane crystal/PLL power-up witness (SsbPowerOn ran at FindCard, before this). */
     SayH("    GPIO_IN @entry= ", (unsigned long)gBus.gpioIn, 8);
     if(gBus.gpioIn & 0x40UL) Say("      xtal bit 0x40 was ALREADY set -> power dance SKIPPED (this boot's clock was up)");
@@ -7411,19 +8227,40 @@ int ApOtmHalOpen(void)
     }
     ApShimScanBackplane();
     ApShimEnableCore();
+    /* ★ k244 SELF-PINPOINTING. k243 stopped silently on the tester's BCM4306/2 somewhere in the steps
+     * below and left nothing to read: the only flush between ApShimEnableCore's DIAG and the end of Open
+     * was the one at the very end. Each step is now announced AND flushed before it runs (ApDiagMark =
+     * Say + flush), so a hang leaves that step's name as the log's last line, and the firmware result is
+     * decoded and on disk before anything downstream touches the card. Same calls, same order; costs one
+     * FlushVol per step at boot. */
+    ApDiagMark("  [k244] >> ApShimLoadFirmware");
     ApShimLoadFirmware();
+    ApShimSayFwResult();
+    ApDiagMark("  [k244] >> ApShimGpioInit");
     ApShimGpioInit();
+    ApDiagMark("  [k244] >> ApShimApplyInitvals");
     ApShimApplyInitvals();
+    ApDiagMark("  [k244] >> ApShimRadioOn");
     ApShimRadioOn();
+    ApDiagMark("  [k244] >> ApShimPhyInit");
     ApShimPhyInit();
+    ApDiagMark("  [k244] >> ApShimChipInitTail");
     ApShimChipInitTail();
+    ApDiagMark("  [k244] >> ApShimCoreInitMid");
     ApShimCoreInitMid();              /* k194: b43_wireless_core_init's middle, b43's position */
+    ApDiagMark("  [k244] >> ApShimDmaInit");
     ApShimDmaInit();
+    ApDiagMark("  [k244] >> ApShimCoreInitTail");
     ApShimCoreInitTail();
+    ApDiagMark("  [k244] >> ApShimMacOn");
     ApShimMacOn();
+    ApDiagMark("  [k244] >> ApShimTxInit");
     ApShimTxInit();
+    ApDiagMark("  [k244] >> ApShimReadNodeName");
     ApShimReadNodeName();
+    ApDiagMark("  [k244] >> ApShimJoin");
     ApShimJoin();
+    ApDiagMark("  [k244] >> ApShimDmaMemProbe");
     ApShimDmaMemProbe();              /* k200: task level, before the IRQ is armed and before any data post */
     /* ★ 8-58: ARM THE INTERRUPT -- RX is wired now (the pump delivers via ApOtmRxInject). The ISR
      * machinery (ApShimSecondaryHandler) is proven safe (k89: 527 IRQs, machine survived); the only
@@ -7438,8 +8275,11 @@ int ApOtmHalOpen(void)
     /* ★ k204: armed whenever the MAC is up, not only after a join. With no key the pump drops every data
      * frame it walks (no PTK: decrypt fails, counted), exactly as before the join -- but it also stamps our
      * AP's beacons, and those are how the link layer knows when a rejoin can succeed. */
+    ApDiagMark((gShimMacEverOn && !gIrqArmed) ? "  [k244] >> AirPortShimArmIrq -- arming; interrupts are live from here"
+                                              : "  [k244] >> AirPortShimArmIrq -- not arming (MAC never came up)");
     if(gShimMacEverOn && !gIrqArmed) (void)AirPortShimArmIrq();
 #endif
+    ApDiagMark("  [k244] >> ApLinkStart");
     ApLinkStart(gJoined);             /* k204: the heartbeat + task pump; transmit held until joined */
     /* ★ FILE WITNESS. The native path does not go through EnetHAL_Open, which is where the shim
      * path flushes the in-memory log ring to "AirPort Driver Log". Flush it here so an ordinary
@@ -7458,18 +8298,102 @@ int ApOtmHalOpen(void)
 #endif
 }
 
+/* ★★ k240: THE TEARDOWN NOW HAPPENS AT EVERY SLEEP, SO IT MUST GIVE THE MEMORY BACK -- AND MAY ONLY DO SO
+ * WHEN THE CARD HAS LET GO OF IT.
+ *
+ * Through k239 the native teardown never freed the DMA memory (ApShimDmaFree's only callers are DmaInit's
+ * failure paths): RX ring 8 KB + RX pool 132 KB + TX ring 8 KB + TX pool 12 KB + the k195 ring's 68 KB, about
+ * 228 KB of LOCKED system heap per load. That cost nothing while an unload meant a TCP/IP port switch. Now
+ * TCP/IP unloads us at every sleep (see the lifecycle block), and every wake loads a new copy that allocates
+ * again: kept as it was, each sleep would leak 228 KB of locked memory.
+ *
+ * So the teardown frees it -- but the card holds these blocks' PHYSICAL addresses until both DMA engines
+ * have stopped, and AirPortShimQuiesce casts both reset results to void. Here every result is kept:
+ *   - config space first (non-faulting): if BAR0 is no longer the one we mapped, the card was reset (a wake
+ *     from a sleep that cut its power, with this copy still loaded -- wake-on-network). A reset card runs no
+ *     engine and decodes nothing, so no register is touched and the memory is free to go.
+ *   - otherwise select the 802.11 core (the resets address it through the window), suspend the MAC, reset
+ *     both engines, and free the memory ONLY if both report DISABLED. If either does not, the blocks are
+ *     deliberately leaked: a leak is recoverable, a card DMAing into freed memory is not.
+ * The memory calls (UnlockMemory, DisposePtr) are task level: TerminateStreamModule is OT's unload call,
+ * and this teardown already ran DisposeNMUPP and InstallInterruptFunctions there through k239 -- including
+ * at the sleep unload of Run 20 Part B, which slept and woke cleanly. */
+static UInt32 gQzBits = 0, gDmaFreed = 0;
+
+static int ApShimCardStillOurs(void)      /* config space only: BAR0 where we mapped it, and decoding */
+{
+    UInt32 bar = 0; UInt16 cmd = 0;
+    if(gBus.acqBar0Want == 0) return 0;
+    if(ExpMgrConfigReadLong(&gBus.node, (LogicalAddress)0x10, &bar) != noErr) return 0;
+    if(ExpMgrConfigReadWord(&gBus.node, (LogicalAddress)0x04, &cmd) != noErr) return 0;
+    return ((bar & 0xFFFFFFF0UL) == (gBus.acqBar0Want & 0xFFFFFFF0UL)) && (cmd & 0x0002);
+}
+
+static UInt32 ApShimQuiesceChecked(void)
+{
+    UInt32 r = 0;
+    if(!gShimMacOn && gShimDmaErr != noErr) return kApQzNoEngines;
+    if(gShimIdx80211 < 0 || SsbSelectCore(&gBus, (UInt32)gShimIdx80211) != noErr) return kApQzNoCore;
+    if(gShimMacOn){ if(MacSuspend()) r |= kApQzMacOk; gShimMacOn = 0; }
+    else r |= kApQzMacOk;
+    if(gShimDmaBase && gBus.bar0){
+        if(gShimTxBase){                    /* the TX engine is on its own controller (see gShimTxBase) */
+            if(DmaControllerTxReset(gShimTxBase)) r |= kApQzTxStopped;
+            ssb_w32(gBus.bar0, gShimTxBase + B43_DMA32_TXRING, 0);
+        } else r |= kApQzTxStopped;
+        {   int rx0, rx3;
+            rx0 = DmaControllerRxReset(gShimDmaBase);
+            ssb_w32(gBus.bar0, gShimDmaBase + B43_DMA32_RXRING, 0);
+            rx3 = ApTs3Stop();              /* k245: ring 3's engine holds a page too (1 when there is none) */
+            if(rx0 && rx3) r |= kApQzRxStopped; }
+    } else r |= kApQzRxStopped | kApQzTxStopped;
+    gShimDmaArmed = 0;
+    gShimRxErr = 1;
+    return r;
+}
+
+/* AirPortShimDisarmIrq without its register write, for a card that was reset: the mask is already 0. */
+static void ApShimDisarmIrqCold(void)
+{
+    gIrqArmed = 0;
+    if(!gIrqInstalled) return;
+    (void)InstallInterruptFunctions(gIstSet,gIstMember,gParentRefCon,
+                                    gParentHandler,gParentEnabler,gParentDisabler);
+    gIrqInstalled = 0;
+}
+
+static void ApShimReleaseDma(void)
+{
+    gDmaFreed = 0;
+    if(!gShimRxRing.raw && !gShimRxPool.raw && !gShimTxRing.raw && !gShimTxPool.raw && !gTxrPool.raw
+       && !gTs3Block.raw) return;
+    if(!(gQzBits & (kApQzNoEngines | kApQzCardReset)) &&
+       (gQzBits & (kApQzRxStopped | kApQzTxStopped)) != (kApQzRxStopped | kApQzTxStopped)) return;
+    DmaBlockFree(&gShimRxRing);
+    DmaBlockFree(&gShimRxPool);
+    ApTs3Free();                    /* k245: ring 3's page -- kApQzRxStopped now covers its engine too */
+    ApShimTxFree();
+    gShimDmaErr = 1;
+    gDmaFreed = 1;
+}
+
 void ApOtmHalClose(void)
 {
+    int ours;
     ApLinkStop();                   /* k204: FIRST -- no heartbeat, no pending NM request into this fragment */
     gOtmNativeMode = 0;             /* stop native RX delivery before the radio goes down */
-    (void)AirPortShimQuiesce();
+    ours = ApShimCardStillOurs();   /* k240: before any register access */
+    gQzBits = ours ? ApShimQuiesceChecked() : kApQzCardReset;
     /* ★ k202: AND TAKE THE INTERRUPT BACK. Found reading the k200 shutdown crash (not its cause -- that
      * was ShareWay's SLP): through k201 this left ApShimIsr installed AND armed with GEN_IRQ_MASK set, so
      * once OT unloaded the fragment the next card interrupt would jump into freed code. The disarm
      * already existed for the app era ("a line left pointing at a fragment that has been unloaded is a
      * crash on the next interrupt"); the native path never called it. Mask first, then put the parent's
      * functions back. Task level: TerminateStreamModule is OT's unload call. */
-    (void)AirPortShimDisarmIrq();
+    if(ours) (void)AirPortShimDisarmIrq();
+    else     ApShimDisarmIrqCold();
+    ApShimReleaseDma();             /* k240: last -- after both the engines and the interrupt are let go */
+    if(gApLife){ gApLife->unloadQuiesce = gQzBits; gApLife->unloadDmaFreed = gDmaFreed; }
 }
 
 int ApOtmHalGetMac(unsigned char out[6])
@@ -7676,6 +8600,12 @@ void ApOtmSnapshot(void)
         Say1("    IRQ secondary ", (unsigned long)gIrqSecondary);
         Say1("    IRQ window BAD", (unsigned long)gIrqWindowBad);      /* > 0: the handler found a foreign core */
         Say1("    IRQ braked    ", (unsigned long)gIrqBraked);
+        if(gShimIsV3){                                              /* k244: the rev-4 core's evidence */
+            Say1("    IRQ DMA1-5 acked (v3)  ", (unsigned long)gIrqDmaOther);   /* > 0: an engine besides RX spoke */
+            SayH("    ...last = engine<<28 | reason ", (unsigned long)gIrqDmaOtherLast, 8);
+            Say ("       (engine 3 = DMA3, the v3 ucode's TX-status ring; reason 0x10000 = RX_DONE, 0xDC00 = fatal errors)");
+            Say1("    TX-status reads skipped (v3)", (unsigned long)gTxStatV3Skipped);
+        }
         Say1("    TX calls      ", (unsigned long)gTxCalls);
         Say1("    TX sent       ", (unsigned long)gTxSent);
         Say1("    TX open (plain)", (unsigned long)gTxOpenFrames);   /* k217: open-network frames */

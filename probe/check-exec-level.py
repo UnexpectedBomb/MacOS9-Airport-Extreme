@@ -93,7 +93,13 @@ ALWAYS_FORBIDDEN = {
     "LoadFw": "calls GetResource", "TxProbeHere": "PROBE-ONLY: transmits a frame",
 }
 TASK_TIME_SELECTORS = {"EnetHAL_Open", "ValidateHardware", "OTScanPorts",
-                       "AirPortShimRejoin", "ApLinkNmResp"}
+                       "AirPortShimRejoin", "ApLinkNmResp",
+                       "InitStreamModule", "TerminateStreamModule"}
+# ★ k240: the native module's load and unload, which Open Transport calls at task level. Through k239 this
+#   audit never looked at either -- yet InitStreamModule runs the whole bring-up, and k240 moved the DMA
+#   memory's release (UnlockMemory, DisposePtr) into TerminateStreamModule, which now runs at every sleep
+#   (TCP/IP unloads the stack at kOTSystemSleep). Audited as task-time entries, like ApLinkNmResp: allocation
+#   is allowed there, an unguarded File Manager call or anything ALWAYS_FORBIDDEN is not.
 # ★ k204: ApLinkNmResp is the Notification Manager response (nmStr = 0): task level in whatever process
 #   runs its event loop. It measures CurrentExecutionLevel() itself before doing anything, and it runs the
 #   join (config space, spins) and the log flush -- so it is AUDITED as a task-time entry, like the
@@ -223,7 +229,8 @@ def main():
     #   vehicle's Notification Manager pump. It measures CurrentExecutionLevel() itself, but an
     #   entry point that allocates and resets the 802.11 core must be AUDITED, not trusted --
     #   that is the same reasoning that put ValidateHardware and OTScanPorts in this list.
-    for boot_entry in ("ValidateHardware", "OTScanPorts", "AirPortShimRejoin", "ApLinkNmResp"):
+    for boot_entry in ("ValidateHardware", "OTScanPorts", "AirPortShimRejoin", "ApLinkNmResp",
+                       "InitStreamModule", "TerminateStreamModule"):
         if boot_entry in defs:
             arms[boot_entry] = defs[boot_entry].split('\n')
 

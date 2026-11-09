@@ -135,7 +135,27 @@ typedef struct {
     UInt32          gpioIn;        /* PCI-config GPIO_IN read at power-on entry */
     UInt32          pwrDanceRan;   /* 1 = we ran the xtal+PLL dance; 0 = crystal already on */
     UInt32          stabortWas;    /* PCI status (0x06) before we scrubbed Signaled Target Abort */
+    /* k240: SsbAcquire's record -- the card's PCI config as found, BEFORE anything was written */
+    UInt32          acqKind;       /* kSsbKind*: where the card sits, which decides what may be written */
+    UInt32          acqVidDid;     /* config 0x00 as read: device << 16 | vendor */
+    UInt32          acqCmdSts;     /* config 0x04 as read: status << 16 | command */
+    UInt32          acqLatCls;     /* config 0x0C as read: BIST | header type | latency timer | cache line */
+    UInt32          acqBar0;       /* config 0x10 as read */
+    UInt32          acqBar0Want;   /* the bus address the Name Registry's assigned-addresses gives BAR0 */
+    UInt32          acqPm;         /* PMCSR's config offset << 16 | PMCSR as read; 0 = no PM capability */
+    UInt32          acqFixed;      /* kSsbFix*: what this acquisition wrote back */
+    UInt32          acqRefused;    /* kSsbAcq*: 0 = acquired, else why the card was left alone */
+    UInt32          acqBridgeBus;  /* CardBus: the bridge's config 0x18 (latency|subordinate|CardBus bus|PCI bus) */
+    UInt32          acqBridgeCmd;  /* CardBus: the bridge's config 0x04 (status << 16 | command) */
+    UInt32          restoreLatCls; /* IN: config 0x0C as the firmware left it at this boot's first acquisition */
+    UInt32          restoreLatClsOk; /* IN: 1 = restoreLatCls is known */
+    /* k241: the card's ancestors as SsbKindOf walked them, nearest first (name, device_type; "" = absent) */
+    UInt32          acqChainN;            /* levels recorded, 0..kSsbChainMax */
+    UInt32          acqBridgeLevel;       /* CardBus: the level the "cardbus" bridge was found at */
+    char            acqChainName[4][24];
+    char            acqChainType[4][16];
 } SsbBus;
+#define kSsbChainMax 4
 
 #define kSsbNoCore 0xFFFFFFFFUL
 
@@ -201,11 +221,213 @@ static void SsbPowerOn(SsbBus *bus)
     }
 }
 
+/* ★★★ k240: ACQUIRE THE CARD -- READ ITS PCI CONFIG BEFORE THE FIRST ACCESS THROUGH THE BAR.
+ *
+ * WHY. 1.0b239d took down the Finder on the FW800 MDD the first time Open Transport loaded the driver after
+ * a deep sleep (Run 20 Part B, 2026-10-26), before the load wrote a single log line. What is known: TCP/IP
+ * unloads itself at every sleep (OTInetControllerLib's kOTSystemSleep handler, unless wake-on-network is set
+ * -- read from the binary) and took this module with it (the panel's "not in use" after the wake is
+ * alive == 0, which only ApLinkStop writes); the next load's first card access is the SPROM MAC read, before
+ * any log line; and SsbFindAndMap took BAR0's address from the Name Registry without ever asking the card.
+ * What is INFERRED, not measured: that the sleep cut the slot's power and left the card's config at power-on
+ * defaults, so that read went to an address the card no longer decodes. The FW800 companion met exactly that
+ * on the NEC ("wake1b went dark reading MMIO with a reset BAR0") and restores its config before any MMIO,
+ * which is what OS X's IOPCIFamily does for every device at wake (pci_restore_state, in Linux's terms). The
+ * record kept below is the measurement.
+ *
+ * WHAT. Read what config space holds, keep every value for the log, then act by where the card sits:
+ *   PCI (the A1026 AirPort slot, or a PCI card): the registry's assigned-addresses is the truth. Put the
+ *     card in D0, BAR0 back (memory decode off while it moves), and the firmware's latency timer and cache
+ *     line size if this boot saw them -- in that order, as a PCI driver must.
+ *   CardBus: Card Services owns the card's config and re-enumerates the socket at wake. Never write it. A
+ *     bridge with no CardBus bus, a card not in D0, or a BAR0 that is not the registry's means Card Services
+ *     has not finished -- refuse, touch nothing, and let the caller ask again.
+ *   A card whose ancestors we cannot place is treated as CardBus: never written.
+ * Config space only (non-faulting); task level (Name Registry iteration). */
+#define kSsbKindPci        0UL   /* direct parent's device_type "pci": the A1026 AirPort slot, or a PCI card */
+#define kSsbKindCardBus    1UL   /* a "cardbus" ancestor at any level (k241; measured: ALBOOK17-CARDBUS.md) */
+#define kSsbKindUnknown    2UL   /* neither: never written */
+
+#define kSsbAcqOk          0UL
+#define kSsbAcqCfgFail     1UL   /* a config-space access itself failed */
+#define kSsbAcqNoAnswer    2UL   /* config 0x00 holds no Broadcom ID: the card is unpowered, or not there yet */
+#define kSsbAcqBridgeBad   3UL   /* CardBus: the bridge has no CardBus bus, or is not decoding and mastering */
+#define kSsbAcqNotOurs     4UL   /* CardBus/unknown: not in D0, or BAR0 not the registry's -- not ours to fix */
+#define kSsbAcqPmStuck     5UL   /* PCI: PMCSR would not go to D0 */
+#define kSsbAcqBar0Stuck   6UL   /* PCI: BAR0 would not take the registry's address */
+
+#define kSsbFixD0          0x01UL  /* PMCSR was D1-D3: wrote D0, waited 10 ms */
+#define kSsbFixBar0        0x02UL  /* BAR0 was not the assigned address: wrote it back */
+#define kSsbFixLatCls      0x04UL  /* latency timer / cache line size put back to the firmware's */
+
+#define kSsbErrRefused     (-2)    /* SsbFindAndMap: SsbAcquire left the card alone; bus->acqRefused says why */
+
+static int SsbStrIs(const char *a, const char *b)
+{
+    while (*a && *a == *b) { a++; b++; }
+    return *a == 0 && *b == 0;
+}
+
+static void SsbCopyStr(char *d, const char *s, UInt32 cap)
+{
+    UInt32 i;
+    for (i = 0; i + 1 < cap && s[i]; i++) d[i] = s[i];
+    d[i] = 0;
+}
+
+/* One string property into buf, always terminated: "" if absent, "(long)" if it does not fit. */
+static void SsbPropStr(RegEntryID *n, const char *prop, char *buf, RegPropertyValueSize cap)
+{
+    RegPropertyValueSize sz = 0;
+    buf[0] = 0;
+    if (RegistryPropertyGetSize(n, prop, &sz) != noErr || sz == 0) return;
+    if (sz > cap - 1) { SsbCopyStr(buf, "(long)", (UInt32)cap); return; }
+    if (RegistryPropertyGet(n, prop, buf, &sz) == noErr && sz < cap) buf[sz] = 0;
+    else buf[0] = 0;
+}
+
+/* ★ k241: WHERE THE CARD SITS, FROM ITS ANCESTORS -- NOT JUST ITS PARENT.
+ * Run 21 (TiBook, Linksys WPC54G): k240 read only the card's parent and logged "parent not named pci or
+ * cardbus", because Card Services publishes a CardBus card as
+ *     cardbus (the bridge)  >  pccard-<vendor>,<device> (NO device_type)  >  the card's function
+ * -- the layout CardBusCompat measured on the same TiBook (MacOS9-AlBook-CardBus logs/tibook 1.5: level 0
+ * pccard-pci1033,35, level 1 cardbus, level 2 pci, level 3 device-tree, level 4 Devices). So walk up, bounded,
+ * the way CardBusCompat's entry_parent does on that machine: set the iterator to the node, ask kRegIterParents
+ * once, repeat from the parent ([[reference_os9_nameregistry_iterate]]: one call, one parent).
+ *   a "cardbus" ancestor at ANY level = CardBus, and that ancestor is the bridge SsbAcquire asks;
+ *   otherwise a direct parent of device_type "pci" = PCI (the A1026 slot, or a PCI card);
+ *   otherwise unknown -- never written.
+ * The nearest kSsbChainMax levels (name, device_type) are kept for the log. Task level. */
+static UInt32 SsbKindOf(SsbBus *bus, RegEntryID *bridge, int *haveBridge)
+{
+    RegEntryID cur, par; RegEntryIter it; Boolean done;
+    UInt32 level, kind = kSsbKindUnknown;
+    int parentIsPci = 0, got;
+    char dt[16];
+    *haveBridge = 0; bus->acqChainN = 0; bus->acqBridgeLevel = 0;
+    RegistryEntryIDInit(&cur);
+    if (RegistryEntryIDCopy(&bus->node, &cur) != noErr) return kind;
+    for (level = 0; level < 8; level++) {
+        got = 0; done = false;
+        RegistryEntryIDInit(&par);
+        if (RegistryEntryIterateCreate(&it) == noErr) {
+            if (RegistryEntryIterateSet(&it, &cur) == noErr &&
+                RegistryEntryIterate(&it, kRegIterParents, &par, &done) == noErr && !done) got = 1;
+            RegistryEntryIterateDispose(&it);
+        }
+        if (!got) { RegistryEntryIDDispose(&par); break; }
+        SsbPropStr(&par, "device_type", dt, (RegPropertyValueSize)sizeof(dt));
+        if (level < kSsbChainMax) {
+            SsbPropStr(&par, "name", bus->acqChainName[level], (RegPropertyValueSize)sizeof(bus->acqChainName[level]));
+            SsbCopyStr(bus->acqChainType[level], dt, (UInt32)sizeof(bus->acqChainType[level]));
+            bus->acqChainN = level + 1;
+        }
+        if (level == 0 && SsbStrIs(dt, "pci")) parentIsPci = 1;
+        if (SsbStrIs(dt, "cardbus")) {
+            if (RegistryEntryIDCopy(&par, bridge) == noErr) *haveBridge = 1;
+            kind = kSsbKindCardBus; bus->acqBridgeLevel = level;
+            RegistryEntryIDDispose(&par);
+            break;
+        }
+        RegistryEntryIDDispose(&cur);              /* step up: the parent becomes the node asked next */
+        RegistryEntryIDInit(&cur);
+        got = (RegistryEntryIDCopy(&par, &cur) == noErr);
+        RegistryEntryIDDispose(&par);
+        if (!got) break;
+    }
+    RegistryEntryIDDispose(&cur);
+    if (kind == kSsbKindUnknown && parentIsPci) kind = kSsbKindPci;
+    return kind;
+}
+
+static OSStatus SsbAcquire(SsbBus *bus, UInt32 want)
+{
+    RegEntryID bridge; int haveBridge = 0, guard = 0;
+    UInt32 v = 0; UInt16 pm = 0, cmd; UInt8 cap = 0, id = 0;
+    unsigned short pmOff = 0;
+
+    bus->acqVidDid = bus->acqCmdSts = bus->acqLatCls = bus->acqBar0 = bus->acqPm = 0;
+    bus->acqFixed = 0; bus->acqRefused = kSsbAcqOk; bus->acqBar0Want = want;
+    bus->acqBridgeBus = bus->acqBridgeCmd = 0;
+    bus->acqKind = SsbKindOf(bus, &bridge, &haveBridge);
+    if (haveBridge) {
+        /* The bridge first (only a CardBus walk returns one): it sits on the host bus, so asking it is always
+         * safe, and a bridge with CardBus bus 0 -- or not decoding (which also stops it forwarding to the card's
+         * memory window) and mastering -- has not been set up by Card Services. The TiBook's PCI1410 reads
+         * command 0x0007, buses 0/1/4 (CardBusCompat 2.5-2.9 -- through RAW config cycles, not this call).
+         * ⚠ So a bridge the Expansion Manager will not read is NOT a refusal: k240 never asked it and acquired
+         *   the TiBook's card fine. Marked unreadable (all-ones) for the log; the card's own checks decide. Only
+         *   a bridge positively read as not set up refuses. */
+        if (bus->acqKind == kSsbKindCardBus) {
+            if (ExpMgrConfigReadLong(&bridge, (LogicalAddress)0x18, &bus->acqBridgeBus) != noErr ||
+                ExpMgrConfigReadLong(&bridge, (LogicalAddress)0x04, &bus->acqBridgeCmd) != noErr)
+                bus->acqBridgeBus = bus->acqBridgeCmd = 0xFFFFFFFFUL;
+            else if (bus->acqBridgeCmd != 0xFFFFFFFFUL &&
+                     (((bus->acqBridgeBus >> 8) & 0xFFUL) == 0 || (bus->acqBridgeCmd & 0x0006UL) != 0x0006UL))
+                bus->acqRefused = kSsbAcqBridgeBad;
+        }
+        RegistryEntryIDDispose(&bridge);
+        if (bus->acqRefused != kSsbAcqOk) return kSsbErrRefused;
+    }
+    if (ExpMgrConfigReadLong(&bus->node, (LogicalAddress)0x00, &bus->acqVidDid) != noErr ||
+        ExpMgrConfigReadLong(&bus->node, (LogicalAddress)0x04, &bus->acqCmdSts) != noErr ||
+        ExpMgrConfigReadLong(&bus->node, (LogicalAddress)0x0C, &bus->acqLatCls) != noErr ||
+        ExpMgrConfigReadLong(&bus->node, (LogicalAddress)0x10, &bus->acqBar0)   != noErr) {
+        bus->acqRefused = kSsbAcqCfgFail; return kSsbErrRefused; }
+    if ((bus->acqVidDid & 0xFFFFUL) != kVendorBroadcom) { bus->acqRefused = kSsbAcqNoAnswer; return kSsbErrRefused; }
+    if (bus->acqCmdSts & 0x00100000UL) {                /* status bit 4: there is a capability list */
+        if (ExpMgrConfigReadByte(&bus->node, (LogicalAddress)0x34, &cap) == noErr) {
+            cap &= 0xFC;
+            while (cap >= 0x40 && guard++ < 48) {
+                UInt8 nxt = 0;
+                if (ExpMgrConfigReadByte(&bus->node, (LogicalAddress)(unsigned long)cap, &id) != noErr) break;
+                if (ExpMgrConfigReadByte(&bus->node, (LogicalAddress)(unsigned long)(cap + 1), &nxt) != noErr) break;
+                if (id == 0x01) { pmOff = (unsigned short)(cap + 4); break; }   /* PCI Power Management */
+                cap = (UInt8)(nxt & 0xFC);
+            }
+        }
+        if (pmOff && ExpMgrConfigReadWord(&bus->node, (LogicalAddress)(unsigned long)pmOff, &pm) == noErr)
+            bus->acqPm = ((UInt32)pmOff << 16) | pm;
+        else pmOff = 0;
+    }
+    if (bus->acqKind != kSsbKindPci) {
+        if ((pmOff && (pm & 0x0003)) || (bus->acqBar0 & 0xFFFFFFF0UL) != (want & 0xFFFFFFF0UL)) {
+            bus->acqRefused = kSsbAcqNotOurs; return kSsbErrRefused; }
+        return noErr;
+    }
+    if (pmOff && (pm & 0x0003)) {                       /* D0 first: a function in D3 need not keep BAR writes */
+        (void)ExpMgrConfigWriteWord(&bus->node, (LogicalAddress)(unsigned long)pmOff, (UInt16)(pm & 0x7FFCU));
+        SsbSpinUs(10000);                               /* PCI PM 1.1: 10 ms from D3hot to D0 */
+        pm = 0xFFFF;
+        if (ExpMgrConfigReadWord(&bus->node, (LogicalAddress)(unsigned long)pmOff, &pm) != noErr || (pm & 0x0003)) {
+            bus->acqRefused = kSsbAcqPmStuck; return kSsbErrRefused; }
+        bus->acqFixed |= kSsbFixD0;
+    }
+    if ((bus->acqBar0 & 0xFFFFFFF0UL) != (want & 0xFFFFFFF0UL)) {
+        cmd = (UInt16)(bus->acqCmdSts & 0xFFFFUL);
+        if (cmd & 0x0002)                               /* stop decoding while the BAR moves */
+            (void)ExpMgrConfigWriteWord(&bus->node, (LogicalAddress)0x04, (UInt16)(cmd & ~0x0002U));
+        if (ExpMgrConfigWriteLong(&bus->node, (LogicalAddress)0x10, want) != noErr ||
+            ExpMgrConfigReadLong(&bus->node, (LogicalAddress)0x10, &v) != noErr ||
+            (v & 0xFFFFFFF0UL) != (want & 0xFFFFFFF0UL)) {
+            bus->acqRefused = kSsbAcqBar0Stuck; return kSsbErrRefused; }
+        bus->acqFixed |= kSsbFixBar0;
+        /* Only after a power cut: the firmware's latency timer + cache line size, as this boot first found
+         * them (the reset value of both is 0). One 16-bit write covers both bytes at 0x0C. */
+        if (bus->restoreLatClsOk && ((bus->acqLatCls ^ bus->restoreLatCls) & 0xFFFFUL)) {
+            (void)ExpMgrConfigWriteWord(&bus->node, (LogicalAddress)0x0C, (UInt16)(bus->restoreLatCls & 0xFFFFUL));
+            bus->acqFixed |= kSsbFixLatCls;
+        }
+    }
+    return noErr;
+}
+
 static OSStatus SsbFindAndMap(SsbBus *bus)
 {
     RegEntryIter c; RegEntryID e; Boolean d=false,f=true; OSStatus er;
     UInt32 *aa=NULL,*la=NULL; RegPropertyValueSize as=0,ls=0; UInt32 i,ne;
     UInt16 cmd=0, back=0;
+    UInt32 bar0Bus=0;
     int found=0;
 
     bus->bar0=0; bus->bar0Size=0; bus->nCores=0;
@@ -233,10 +455,13 @@ static OSStatus SsbFindAndMap(SsbBus *bus)
       if(AA_REG(ph)==0x10&&AA_SPACE(ph)>=2){
         bus->bar0=(volatile void*)la[i];
         bus->bar0Size=aa[i*kAddrEntryWords+4];
+        bar0Bus=aa[i*kAddrEntryWords+2];          /* k240: phys.lo -- the bus address BAR0 must hold */
         break;} }
     DisposePtr((Ptr)aa); DisposePtr((Ptr)la);
     if(bus->bar0==0) return paramErr;
     if(((unsigned long)bus->bar0 & 3UL)!=0UL) return paramErr;   /* refuse misaligned MMIO */
+    /* k240: before anything goes through the BAR -- see SsbAcquire. kSsbErrRefused: nothing was touched. */
+    er=SsbAcquire(bus,bar0Bus); if(er!=noErr){ bus->bar0=0; return er; }   /* unmapped: every bar0 guard holds */
 
     if(ExpMgrConfigReadWord(&bus->node,(LogicalAddress)0x04,&cmd)!=noErr) return paramErr;
     if(!(cmd&0x0002)){

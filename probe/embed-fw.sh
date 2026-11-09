@@ -19,6 +19,7 @@ set -eu
 # destination address. See FEASIBILITY.md, "THE FIRMWARE AND THE DRIVER CODE ARE FROM MUTUALLY
 # EXCLUSIVE GENERATIONS". Pass ../firmware/v3 explicitly if you ever need the old set back.
 FWDIR="${1:-../firmware/v4}"
+V3DIR="../firmware/v3"          # b43legacy v3 set (BCM4306/2, core rev 4); dual-embedded into the C header
 OUT="${2:-firmware_blobs.r}"
 GEN="$(basename "$FWDIR")"
 
@@ -100,6 +101,18 @@ emit_c_one() {   # emit_c_one <file> <symbol> <description>
   emit_c_one "$FWDIR/pcm5.fw"            kApFwPcm    "pcm5 (crypto engine microcode)"
   emit_c_one "$FWDIR/b0g0initvals5.fw"   kApFwIv     "b0g0initvals5 (G-PHY init values)"
   emit_c_one "$FWDIR/b0g0bsinitvals5.fw" kApFwBsIv   "b0g0bsinitvals5 (band-switch init values)"
+  #
+  # ── b43legacy v3 generation: BCM4306/2 (early A1026), 802.11 core rev 4 ───────────────────────
+  # Dual-embedded so ONE driver serves both silicon generations; ApShimLoadFirmware selects by core
+  # rev (<=4 -> these v3 blobs + b43legacy SHM routing; >=5 -> the v4 blobs above). Core rev 4 loads
+  # ucode4 + pcm4 + b0g0initvals2 and NO band-specific initvals (b43legacy request_firmware returns
+  # NULL for rev 4). These come from ../firmware/v3 (the b43legacy-standard set), not the kext.
+  echo
+  echo "/* --- v3 (b43legacy) generation: BCM4306/2, 802.11 core rev 4 --- */"
+  echo
+  emit_c_one "$V3DIR/ucode4.fw"          kApFwUcodeV3 "ucode4 (802.11 core rev 4, v3/b43legacy)"
+  emit_c_one "$V3DIR/pcm4.fw"            kApFwPcmV3   "pcm4 (crypto engine microcode, v3)"
+  emit_c_one "$V3DIR/b0g0initvals2.fw"   kApFwIvV3    "b0g0initvals2 (G-PHY rev-1 init values, v3)"
   echo "#endif"
 } > "$COUT.tmp"
 mv "$COUT.tmp" "$COUT"

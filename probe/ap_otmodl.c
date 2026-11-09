@@ -26,7 +26,7 @@
 /* Freshness witness for THIS part of the deliverable: the init beacon carries this number, so
  * reading airport-otmodl-init == AP_OTMODL_BUILD proves this exact module loaded (not a stale one).
  * [[feedback_freshness_witness_outside_the_test]] -- one witness per part of a multi-part ship. */
-#define AP_OTMODL_BUILD  235
+#define AP_OTMODL_BUILD  245
 
 /* ★★★ 8-61: k163 SAFE DIAGNOSTIC. Hold RX delivery OFF -- count the whole path but do NOT hand
  * frames to OT, so there is no corruption and no crash. With the module stable, the boot vehicle's
@@ -47,6 +47,8 @@ extern int  ApOtmHalOpen(void);                      /* bring-up + join; 0 = ok 
 extern void ApOtmHalClose(void);
 extern int  ApOtmHalGetMac(unsigned char out[6]);    /* 0 = ok */
 extern int  ApOtmHalTx(const unsigned char *frame, unsigned long len);  /* full Ethernet frame */
+extern void ApOtmLifeLoad(void);                     /* k240: the lifecycle block (ap_shim.c) */
+extern void ApOtmLifeUnload(UInt32 qopens, UInt32 qcloses);
 
 #define AP_MAC_LEN    6
 #define AP_SAP_LEN    2
@@ -68,6 +70,7 @@ typedef void     (*qenable_t)(queue *q);                  /* k202: wake our writ
 
 typedef long     (*createDT_t)(void *proc, void *arg);   /* OTCreateDeferredTask (OTKernelUtilLib) */
 typedef Boolean  (*scheduleDT_t)(long cookie);           /* OTScheduleDeferredTask */
+typedef OSStatus (*destroyDT_t)(long cookie);            /* k240: OTDestroyDeferredTask (OTKernelUtilLib) */
 typedef UInt32   (*mkPortRef_t)(UInt8 bus, UInt16 dev, UInt16 slot, UInt16 other); /* OTCreatePortRef */
 typedef OSStatus (*chgPortState_t)(UInt32 ref, UInt32 event, OSStatus result);     /* OTChangePortState */
 typedef void *   (*findPortByDev_t)(UInt32 dev);   /* 8-80 k186: OTFindPortByDev (OTKernelLib) */
@@ -85,6 +88,7 @@ static struct {
     qenable_t    qenable;       /* k202: OPTIONAL -- without it, a full TX ring drops as through k201 */
     createDT_t   createDT;      /* 8-59: deferred-task RX delivery -- allocb/putnext are NOT */
     scheduleDT_t scheduleDT;    /* interrupt-safe; the ISR only enqueues+schedules, this drains */
+    destroyDT_t  destroyDT;     /* k240: OPTIONAL -- TerminateStreamModule destroys the task it created */
     mkPortRef_t    mkPortRef;   /* 8-63: OTCreatePortRef -- recompute our port ref (matches ap_boot) */
     chgPortState_t chgPortState;/* 8-63: OTChangePortState -- announce kOTPortOnline, like OTModl$radio */
     findPortByDev_t findPortByDev; /* 8-80 k186: OTFindPortByDev -- get OT's internal port record + its ref */
@@ -254,6 +258,9 @@ static int ResolveOTPrimitives(void)
       if (GetSharedLibrary("\pOTKernelUtilLib", kPowerPCCFragArch, kLoadCFrag, &uid, &ua, ue) == noErr) {
         ok &= ResolveOne(uid, "OTCreateDeferredTask",   (void **)&gOT.createDT);
         ok &= ResolveOne(uid, "OTScheduleDeferredTask", (void **)&gOT.scheduleDT);
+        /* k240: Apple's OTModl$radio imports it from here too. Optional: without it the task is left,
+         * as through k239. */
+        (void)ResolveOne(uid, "OTDestroyDeferredTask", (void **)&gOT.destroyDT);
         /* 8-63: link-up primitives, resolved from the SAME library. Not folded into `ok` -- if OT
          * lacks them we degrade (no online announce) rather than fail every RX primitive. */
         (void)ResolveOne(uid, "OTCreatePortRef",   (void **)&gOT.mkPortRef);
@@ -964,10 +971,20 @@ void ApOtmNotifyNetworkChange(void)
 }
 
 install_info *GetOTInstallInfo(void)      { apBeacon("airport-otmodl-getinfo", 0x67494E46UL); return &gInstallInfo; }  /* 'gINF' -- OT read our install_info */
+/* ★ k240: TerminateStreamModule has run on THIS copy. It is Open Transport's unload call, so the next load
+ * should be a fresh copy of the fragment (not measured: the Run 20 Part B reload crashed before it logged).
+ * If OT ever re-initialised a terminated copy instead, every once-per-load step of the bring-up would be
+ * skipped on a card that may have lost power: refuse it, loudly, rather than run half a bring-up. The
+ * lifecycle block counts it (reusedInstances). */
+static int gTerminated = 0;
+extern void ApOtmLifeReused(void);
+
 Boolean InitStreamModule(void *pi)
 {
     (void)pi;
     apBeacon("airport-otmodl-init", (UInt32)AP_OTMODL_BUILD);   /* value = build # (freshness) */
+    ApOtmLifeLoad();                       /* k240: first -- the lifecycle block and the log's load banner */
+    if (gTerminated) { ApOtmLifeReused(); gHalUp = 0; return true; }   /* qopen refuses on !gHalUp */
     if (!ResolveOTPrimitives()) return false;
     /* ★★★ k177: APPLE'S ARCHITECTURE (disassembled from OTModl$radio). Apple does hardware bring-up
      * at module init (PrepFirmware/LoadMyMacAdrs) and ValidateHardware(main:FindCard) -- NEVER in the
@@ -986,5 +1003,10 @@ Boolean InitStreamModule(void *pi)
 void TerminateStreamModule(void)
 {
     apBeacon("airport-otmodl-term", 0x5445524DUL);   /* 'TERM' */
+    ApOtmLifeUnload(gQopenCount, gQcloseCount);     /* k240: first, while the link state is still this copy's */
     ApOtmHalClose();                       /* k177: tear the radio down at module unload, not stream close */
+    /* k240: and the deferred task ApOtmSetupRx created. Through k239 it outlived the fragment it points into;
+     * every sleep is now an unload. The interrupt is already disarmed (ApOtmHalClose), so nothing schedules it. */
+    if (gRxDtCookie && gOT.destroyDT) { (void)(*gOT.destroyDT)(gRxDtCookie); gRxDtCookie = 0; }
+    gTerminated = 1;
 }

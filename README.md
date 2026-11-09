@@ -10,8 +10,9 @@ with its own hardware: it scans, joins WPA2-secured or open networks, remembers 
 own at start-up, all from a native control panel and Control Strip module, with no Mac OS X involved.
 
 > **Status: working on real hardware.** WPA2-Personal and open-network joins are tested on a Power Mac G4
-> MDD with an A1026 (BCM4306) card, and -- new in this release -- on a BCM4318 PCI card (Linksys WMP54GS)
-> at full 802.11g speed. It is a hobby project, offered as-is; see [Limitations](#limitations).
+> MDD with an A1026 (BCM4306) card and on a BCM4318 PCI card (Linksys WMP54GS) at full 802.11g speed. New
+> in this release: support for the earliest A1026 cards, which use an older revision of the BCM4306
+> (confirmed on a PowerBook5,1). It is a hobby project, offered as-is; see [Limitations](#limitations).
 
 ## What you get
 
@@ -31,7 +32,7 @@ Three native OS 9 pieces:
 - A **Broadcom BCM4306 or BCM4318 802.11g card**. The common BCM4306 is Apple's **A1026** (PCI ID
   `14e4:4320`); the **BCM4318** (`14e4:4318`) is the later single-chip part, used on the A1126 / A1127
   Wi-Fi/Bluetooth combo cards and on PCI/CardBus adapters such as the Linksys WMP54GS. **Both are driven**,
-  except some of the very earliest A1026 cards (see [Compatibility](#compatibility)). The driver checks the
+  including the very earliest A1026 cards (see [Compatibility](#compatibility)). The driver checks the
   card at start-up and steps aside cleanly if it cannot drive it, so an unsupported card does no harm.
 - **Broadcom firmware** is already embedded in the pre-built driver on the [Releases](../../releases) page,
   so if you use the download there is nothing extra to fetch. Only when you build from source do you retrieve
@@ -56,11 +57,10 @@ The first table below lists the OS 9-capable
 G4s that took the discrete **A1026** card: all are expected to work, but only the rows marked Yes are
 confirmed.
 
-**One known exception: the earliest A1026 cards.** Some of the first A1026 cards use an older revision of
-the BCM4306 chip that this release cannot start yet; it was found on a 17-inch 1.0GHz PowerBook G4
-(PowerBook5,1). On such a card the driver steps aside without harm, and the **AirPort Driver Log** in the
-System Folder reports that the microcode is not up. It is the card, not the Mac: a later A1026 in the same
-machine is expected to work. Support for these early cards is in development.
+**The earliest A1026 cards are supported too.** Some of the first A1026 cards use an older revision of
+the BCM4306 chip (802.11 core revision 4) that needs older Broadcom firmware. Releases before 1.0b245
+could not start it; 1.0b245 carries both firmware generations and picks the right one for the card. It is
+confirmed on a 17-inch 1.0GHz PowerBook G4 (PowerBook5,1), joining a WPA2 network and browsing the web.
 
 
 AIRPORT EXTREME (A1026) COMPATIBLE G4 MACS
@@ -77,7 +77,7 @@ AIRPORT EXTREME (A1026) COMPATIBLE G4 MACS
 | iBook G4 (2003, Radeon 9200) | PowerBook6,3 | Unconfirmed |
 | Al PowerBook G4 12" 867MHz | PowerBook6,1 | Yes |
 | Al PowerBook G4 12" 1.0-1.5GHz | PowerBook6,2 / 6,4 / 6,8 | Unconfirmed |
-| Al PowerBook G4 17" 1.0GHz | PowerBook5,1 | No (early A1026 card, see above) |
+| Al PowerBook G4 17" 1.0GHz | PowerBook5,1 | Yes |
 | Al PowerBook G4 15" 1.0/1.25GHz | PowerBook5,2 | Unconfirmed |
 | Al PowerBook G4 17" 1.33GHz | PowerBook5,3 | Unconfirmed |
 | Al PowerBook G4 15" 1.33/1.5GHz | PowerBook5,4 | Unconfirmed |
@@ -150,7 +150,8 @@ Not supported: WEP, the original WPA/TKIP, WPA3-only (SAE), or 802.1X / Enterpri
 
 - Confirmed only on the Macs and cards listed as confirmed in [Compatibility](#compatibility); everything else
   relies on community reports.
-- Some of the earliest A1026 cards are not supported yet (see [Compatibility](#compatibility)).
+- On the one early A1026 card tested so far, a join sometimes needed an automatic retry or two before it
+  connected.
 - No hidden-network ("closed SSID" / manual "Other...") entry yet.
 - With a base station that presents several BSSIDs for one SSID, a join may occasionally come back from a
   different BSSID of the same network; this is being hardened.

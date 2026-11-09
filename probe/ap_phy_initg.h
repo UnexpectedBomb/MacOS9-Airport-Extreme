@@ -44,6 +44,13 @@
 #ifndef AP_PHY_INITG_H
 #define AP_PHY_INITG_H
 
+/* ★ k244: self-pinpointing hook. ap_shim.c defines it (Say + flush to disk) before this header arrives,
+ * so a hang inside the rev-1 path leaves the block's name as the driver log's last line. Every other
+ * includer gets nothing, so the app's build and narration are untouched. */
+#ifndef AP_PHY_MARK
+#define AP_PHY_MARK(s) ((void)0)
+#endif
+
 #include "ap_bringup.h"
 
 #pragma GCC diagnostic push
@@ -110,6 +117,13 @@ typedef struct {
  * constants. The probe measures radio ver/rev, chip id and the PCI subsystem IDs at runtime and
  * derives the same values b43 would, so a card that is not the one these were reasoned about
  * produces a refusal instead of a silently wrong attenuation. ---- */
+/* ★ gShimIsV3: 1 for the BCM4306/2 (802.11 core rev <= 4 = v3/b43legacy firmware, G-PHY rev 1,
+ * analog 1), 0 for the shipped rev >= 5 path (4306/3, 4318). Set by ApShimLoadFirmware once the core
+ * rev is read. Declared HERE rather than in ap_tx.h because the include chain processes
+ * ap_phy_initg.h before ap_tx.h's body, so SetBasebandAtt / RadioInit2050 / ApPhyInitG below AND the
+ * GenerateTxHdr351 dispatchers in ap_tx.h all share this one flag. */
+static int gShimIsV3 = 0;
+
 static UInt16 DefaultBasebandAtt(UInt16 radioVer,UInt16 radioRev)
 { if(radioVer==0x2050U && radioRev<6U) return 0; return 2; }
 
@@ -206,6 +220,7 @@ static UInt16 bbAttG=0,rfAttG=0;
 #define B43_PHYVER_VERSION     0x00FF
 #define B43_OFDMTAB_AGC1       B43_OFDMTAB(0x00,0)   /* 0x0000 */
 #define B43_OFDMTAB_GAINX      B43_OFDMTAB(0x01,0)   /* 0x0400 */
+#define B43_OFDMTAB_GAINX_R1   B43_OFDMTAB(0x14,0)   /* 0x5000 -- G-PHY rev <= 1 (b43 phy_g.c:312; b43legacy ILT 0x5000, radio.c:143) */
 #define B43_OFDMTAB_AGC3       B43_OFDMTAB(0x02,0)   /* 0x0800 */
 #define B43_OFDMTAB_NOISESCALE B43_OFDMTAB(0x05,0)   /* 0x1400 */
 #define B43_OFDMTAB_AGC2       B43_OFDMTAB(0x06,0)   /* 0x1800 */
@@ -509,8 +524,12 @@ static UInt16 OfdmTabRead16(UInt16 table,UInt16 offset)
 /* b43_gphy_set_baseband_attenuation. analog is 2 (> 1), so only that arm is ported; the analog==0
  * arm drives B43_MMIO_PHY0 instead and the analog==1 arm shifts by 3 rather than 2. */
 static void SetBasebandAtt(UInt16 att)
-{ PhyWrite((UInt16)B43_PHY_DACCTL,
-           (UInt16)((PhyRead((UInt16)B43_PHY_DACCTL)&0xFFC3)|(UInt16)(att<<2))); }
+{ if(gShimIsV3)   /* analog 1 (BCM4306/2): shift by 3, mask 0xFF87 (b43 phy_g.c:196 / b43legacy phy.c) */
+    PhyWrite((UInt16)B43_PHY_DACCTL,
+             (UInt16)((PhyRead((UInt16)B43_PHY_DACCTL)&0xFF87)|(UInt16)(att<<3)));
+  else            /* analog 2 (shipped 4306/3, 4318): shift by 2, mask 0xFFC3 */
+    PhyWrite((UInt16)B43_PHY_DACCTL,
+             (UInt16)((PhyRead((UInt16)B43_PHY_DACCTL)&0xFFC3)|(UInt16)(att<<2))); }
 
 /* A self-verifying phy_maskset. b43_phy_maskset READS the register by definition, so reading it
  * again to check the result is sanctioned -- and `want` is computed from the value measured
@@ -933,11 +952,16 @@ static UInt16 RadioInit2050(void)
   PhyMaskSet((UInt16)B43_PHY_ANALOGOVERVAL,0xFFFC,0);
   PhyMaskSet((UInt16)B43_PHY_CRS0,0x7FFF,0);
   PhyMaskSet((UInt16)B43_PHY_CLASSCTL,0xFFFC,0);
-  /* has_loopback_gain TRUE */
-  sLoMask=PhyRead((UInt16)B43_PHY_LO_MASK);
-  sLoCtl=PhyRead((UInt16)B43_PHY_LO_CTL);
-  PhyWrite((UInt16)B43_PHY_LO_MASK,0x8020);    /* rev < 3 */
-  PhyWrite((UInt16)B43_PHY_LO_CTL,0);
+  /* has_loopback_gain. ⚠ b43legacy gates this on literal rev > 1 (radio.c:1522), so it is SKIPPED
+   * for the rev-1 BCM4306/2; the rev-2+ path keeps it. (b43 would take it for rev-1 gmode; we follow
+   * the b43legacy regime that matches our v3 firmware. ORACLE: confirm against the kext.) */
+  sLoMask=0; sLoCtl=0;
+  if(!gShimIsV3){
+    sLoMask=PhyRead((UInt16)B43_PHY_LO_MASK);
+    sLoCtl=PhyRead((UInt16)B43_PHY_LO_CTL);
+    PhyWrite((UInt16)B43_PHY_LO_MASK,0x8020);    /* rev < 3 */
+    PhyWrite((UInt16)B43_PHY_LO_CTL,0);
+  }
   PhyWrite((UInt16)B43_PHY_RFOVERVAL,Radio2050RfoverVal((UInt16)B43_PHY_RFOVERVAL,LPD(0,1,1)));
   PhyWrite((UInt16)B43_PHY_RFOVER,   Radio2050RfoverVal((UInt16)B43_PHY_RFOVER,0));
 
@@ -949,8 +973,8 @@ static UInt16 RadioInit2050(void)
   sReg3E6=ssb_r16(gBus.bar0,B43_MMIO_PHY0);
   sReg3F4=ssb_r16(gBus.bar0,B43_MMIO_CHANNEL_EXT);
 
-  /* analog is 2, so the else arm, and analog >= 2 adds the CCK 0x03 maskset */
-  PhyMaskSet((UInt16)B43_PHY_CCK(0x03),0xFFBF,0x0040);
+  /* else arm (analog != 0). The analog >= 2 CCK 0x03 maskset is SKIPPED for analog-1 (BCM4306/2). */
+  if(!gShimIsV3) PhyMaskSet((UInt16)B43_PHY_CCK(0x03),0xFFBF,0x0040);
   ssb_w16(gBus.bar0,B43_MMIO_CHANNEL_EXT,
           (UInt16)(ssb_r16(gBus.bar0,B43_MMIO_CHANNEL_EXT)|0x2000));
 
@@ -1029,8 +1053,8 @@ static UInt16 RadioInit2050(void)
   PhyWrite((UInt16)B43_PHY_ANALOGOVERVAL,sAnalogoverval);
   PhyWrite((UInt16)B43_PHY_CRS0,sCrs0);
   PhyWrite((UInt16)B43_PHY_CLASSCTL,sClassctl);
-  PhyWrite((UInt16)B43_PHY_LO_MASK,sLoMask);
-  PhyWrite((UInt16)B43_PHY_LO_CTL,sLoCtl);
+  if(!gShimIsV3){ PhyWrite((UInt16)B43_PHY_LO_MASK,sLoMask);   /* only if the loopback block ran */
+                  PhyWrite((UInt16)B43_PHY_LO_CTL,sLoCtl); }
 
   gI2050RestoreBad=0;
   { UInt16 r[12],w[12]; int n=0,z;
@@ -1045,7 +1069,7 @@ static UInt16 RadioInit2050(void)
     r[n]=(UInt16)B43_PHY_ANALOGOVERVAL; w[n++]=sAnalogoverval;
     r[n]=(UInt16)B43_PHY_CRS0;          w[n++]=sCrs0;
     r[n]=(UInt16)B43_PHY_CLASSCTL;      w[n++]=sClassctl;
-    r[n]=(UInt16)B43_PHY_LO_MASK;       w[n++]=sLoMask;
+    if(!gShimIsV3){ r[n]=(UInt16)B43_PHY_LO_MASK; w[n++]=sLoMask; }  /* LO_MASK saved only on rev>=2 */
     for(z=0;z<n;z++){ UInt16 got=PhyRead(r[z]);
       if(got!=w[z]){ gI2050RestoreBad++;
         { Str255 L;L[0]=0;PCat(L,"      ✗ PHY 0x");PCatHex(L,r[z],4);
@@ -1061,6 +1085,114 @@ static UInt16 RadioInit2050(void)
   gTmp1=tmp1; gTmp2=tmp2; gRcc=rcc; gRadio78=radio78;
   if(i>15){ ret=radio78; gInitvalFromRadio78=1; }
   else    { ret=rcc;     gInitvalFromRadio78=0; }
+  return ret;
+}
+
+/* ★★ k244: b43legacy_radio_init2050 FOR THE REV-1 G-PHY (BCM4306/2) -- TRANSLITERATED, NOT GATED INTO
+ * THE b43 VERSION ABOVE, which stays byte-identical for the 4306/3 and the 4318.
+ *
+ * WHY. k243 froze on the tester's card somewhere after the DIAG flush, and RadioInit2050 above is the
+ * prime suspect: it takes b43's `gmode || rev >= 2` arm, so it reads, sets, hammers through both 16x16
+ * loops, and restores PHY 0x0811/0x0812/0x0814/0x0815 (RFOVER, RFOVERVAL, ANALOGOVER, ANALOGOVERVAL).
+ * b43legacy never touches any of them on rev 1. Every one in its init2050 sits inside `if (phy->gmode)`
+ * (radio.c:1502, 1571-1661, 1689), and on a rev-1 G-PHY init2050 runs ONLY in phy_calibrate's pass,
+ * which first resets the core WITHOUT GMODE (phy.c:116-124; main.c:695-699 then sets gmode = false). The
+ * gmode pass that follows reuses the result instead of calling init2050 again (phy.c:1033-1036). Apple's
+ * wl skips the same block for rev <= 1. pt3 gated the loopback block and the CCK 0x03 maskset out of
+ * RadioInit2050 and missed this whole arm. On rev 1 the registers it hammers are ones the references never
+ * address, and on this silicon an indirect access to a register that is not there master-aborts (g1-h2).
+ *
+ * So this is b43legacy's function with gmode false and type G, statement for statement -- including two
+ * places where it differs from b43's and so from RadioInit2050 above: tmp2 is NOT reset per outer pass
+ * (b43 does not reset it either; ours does), and when the sweep runs out the result is radio 0x78 READ
+ * BACK (backup[13]) on `i >= 15`. The restore is radio_selectchannel(channel, 1): synth-pu workaround,
+ * the channel, then msleep(8) (radio.c:1762).
+ *
+ * ⚠ WHAT IT LEAVES BEHIND, which b43legacy's later pass cleans up: PHY_RADIO bit 15 stays set (the clear
+ *   is in the gmode restore), PHY 0x002B keeps the 0x1403 it writes (it never restores it), and radio
+ *   0x78 holds the sweep's last value. In b43legacy the core reset between the passes (PHYRESET asserted)
+ *   returns the first two to their reset values -- gmode initb5 then writes PHY_RADIO = 0 and nothing
+ *   writes 0x002B -- and its second initg writes radio 0x78 = initval. We run one pass, so ApPhyInitG's
+ *   rev-1 branch restores all three. */
+static UInt16 RadioInit2050Legacy(void)
+{
+  UInt16 b0,b1,b10,b11,b12,b13=0,b14,b15,b16,b17,b18;
+  UInt16 rcc,ret,i,j,analog;
+  UInt32 tmp1=0,tmp2=0;
+
+  analog=(UInt16)((ssb_r16(gBus.bar0,B43_MMIO_PHY_VER)&0xF000)>>12);   /* PHYVER_ANALOG: 1 on this card */
+  b0 =RadioRead(0x0043);
+  b14=RadioRead(0x0051);
+  b15=RadioRead(0x0052);
+  b1 =PhyRead(0x0015);
+  b16=PhyRead(0x005A);
+  b17=PhyRead(0x0059);
+  b18=PhyRead(0x0058);
+  /* type G, gmode false: the else arm is entirely `if (phy->gmode)` -- nothing runs (radio.c:1501-1543) */
+  ssb_w16(gBus.bar0,B43_MMIO_PHY_RADIO,(UInt16)(ssb_r16(gBus.bar0,B43_MMIO_PHY_RADIO)|0x8000));
+  b10=PhyRead(0x0035);
+  PhyWrite(0x0035,(UInt16)(PhyRead(0x0035)&0xFF7F));
+  b11=ssb_r16(gBus.bar0,B43_MMIO_PHY0);                                  /* MMIO 0x03E6 */
+  b12=ssb_r16(gBus.bar0,B43_MMIO_CHANNEL_EXT);
+
+  if(analog==0) ssb_w16(gBus.bar0,B43_MMIO_PHY0,0x0122);
+  else {
+    if(analog>=2) PhyWrite(0x0003,(UInt16)((PhyRead(0x0003)&0xFFBF)|0x0040));
+    ssb_w16(gBus.bar0,B43_MMIO_CHANNEL_EXT,(UInt16)(ssb_r16(gBus.bar0,B43_MMIO_CHANNEL_EXT)|0x2000)); }
+
+  rcc=RadioCoreCalibrationValue();                  /* = b43legacy_radio_calibrationvalue (radio.c:1366) */
+  ret=rcc;
+  /* type G: no radio 0x78 = 0x26. gmode false: no 0x0812 write here or anywhere in either loop. */
+  PhyWrite(0x0015,0xBFAF);
+  PhyWrite(0x002B,0x1403);
+  PhyWrite(0x0015,0xBFA0);
+  RadioWrite(0x0051,(UInt16)(RadioRead(0x0051)|0x0004));
+  if(gShimRadioRev==8U) RadioWrite(0x0043,0x001F);
+  else { RadioWrite(0x0052,0x0000);
+         RadioWrite(0x0043,(UInt16)((RadioRead(0x0043)&0xFFF0)|0x0009)); }
+  PhyWrite(0x0058,0x0000);
+
+  for(i=0;i<16;i++){
+    PhyWrite(0x005A,0x0480); PhyWrite(0x0059,0xC810); PhyWrite(0x0058,0x000D);
+    PhyWrite(0x0015,0xAFB0); SsbSpinUs(10);
+    PhyWrite(0x0015,0xEFB0); SsbSpinUs(10);
+    PhyWrite(0x0015,0xFFF0); SsbSpinUs(20);
+    tmp1+=(UInt32)PhyRead(0x002D);
+    PhyWrite(0x0058,0x0000);
+    PhyWrite(0x0015,0xAFB0); }
+  tmp1++; tmp1>>=9;
+  SsbSpinUs(10);
+  PhyWrite(0x0058,0x0000);
+
+  for(i=0;i<16;i++){
+    RadioWrite(0x0078,(UInt16)((BitRev4(i)<<1)|0x0020));
+    b13=RadioRead(0x0078);
+    SsbSpinUs(10);
+    for(j=0;j<16;j++){
+      PhyWrite(0x005A,0x0D80); PhyWrite(0x0059,0xC810); PhyWrite(0x0058,0x000D);
+      PhyWrite(0x0015,0xAFB0); SsbSpinUs(10);
+      PhyWrite(0x0015,0xEFB0); SsbSpinUs(10);
+      PhyWrite(0x0015,0xFFF0); SsbSpinUs(10);
+      tmp2+=(UInt32)PhyRead(0x002D);
+      PhyWrite(0x0058,0x0000);
+      PhyWrite(0x0015,0xAFB0); }
+    tmp2++; tmp2>>=8;                               /* carried into the next pass, as in b43legacy */
+    if(tmp1<tmp2) break; }
+  gLoop2Iters=(int)i;
+
+  /* ---- restore (radio.c:1672-1705) ---- */
+  PhyWrite(0x0015,b1);
+  RadioWrite(0x0051,b14); RadioWrite(0x0052,b15); RadioWrite(0x0043,b0);
+  PhyWrite(0x005A,b16); PhyWrite(0x0059,b17); PhyWrite(0x0058,b18);
+  ssb_w16(gBus.bar0,B43_MMIO_PHY0,b11);
+  if(analog!=0) ssb_w16(gBus.bar0,B43_MMIO_CHANNEL_EXT,b12);
+  PhyWrite(0x0035,b10);
+  GphyChannelSwitch(1,1); SsbSpinUs(8000);          /* radio_selectchannel(phy->channel = 1, 1) */
+  /* type G, gmode false: no restore block */
+
+  gTmp1=tmp1; gTmp2=tmp2; gRcc=rcc; gRadio78=b13;
+  if(i>=15){ ret=b13; gInitvalFromRadio78=1; }      /* b43legacy radio.c:1706: `if (i >= 15) ret = backup[13]` */
+  else     {          gInitvalFromRadio78=0; }
   return ret;
 }
 
@@ -1277,12 +1409,17 @@ static SInt32 ClampS32(SInt32 v,SInt32 lo,SInt32 hi)
 { if(v<lo) return lo; if(v>hi) return hi; return v; }
 
 /* b43_set_all_gains. rev 2 > 1, so start/end are 0x08/0x18 and the table is GAINX (not
- * GAINX_R1). Ends with a dummy transmission -- the same routine 4b-ii-4b proved. */
+ * GAINX_R1). Ends with a dummy transmission -- the same routine 4b-ii-4b proved.
+ * ⚠ k244: the rev-1 G-PHY (BCM4306/2) takes the OTHER arm in both b43 (phy_g.c:305-312) and b43legacy
+ *   (radio.c:143, 179): table GAINX_R1 (ILT 0x5000), entries 0x10-0x1F. Hard-coding rev 2 wrote the test card's
+ *   NRSSI-calibration gains into the rev-2 table. */
 static void SetAllGains(SInt16 first,SInt16 second,SInt16 third)
 {
   UInt16 i,tmp;
-  for(i=0;i<4;i++) OfdmTabWrite16((UInt16)B43_OFDMTAB_GAINX,i,(UInt16)first);
-  for(i=0x08;i<0x18;i++) OfdmTabWrite16((UInt16)B43_OFDMTAB_GAINX,i,(UInt16)second);
+  UInt16 table=(UInt16)(gShimIsV3 ? B43_OFDMTAB_GAINX_R1 : B43_OFDMTAB_GAINX);
+  UInt16 start=(UInt16)(gShimIsV3 ? 0x10 : 0x08), end=(UInt16)(gShimIsV3 ? 0x20 : 0x18);
+  for(i=0;i<4;i++) OfdmTabWrite16(table,i,(UInt16)first);
+  for(i=start;i<end;i++) OfdmTabWrite16(table,i,(UInt16)second);
   if(third!=-1){
     tmp=(UInt16)(((UInt16)third<<14)|((UInt16)third<<6));
     PhyMaskSet(0x04A0,0xBFBF,tmp);
@@ -1297,12 +1434,14 @@ static void SetAllGains(SInt16 first,SInt16 second,SInt16 third)
 static void SetOriginalGains(void)
 {
   UInt16 i,tmp;
+  UInt16 table=(UInt16)(gShimIsV3 ? B43_OFDMTAB_GAINX_R1 : B43_OFDMTAB_GAINX);   /* k244: rev-1 arm, as SetAllGains */
+  UInt16 start=(UInt16)(gShimIsV3 ? 0x10 : 0x08), end=(UInt16)(gShimIsV3 ? 0x20 : 0x18);
   for(i=0;i<4;i++){
     tmp=(UInt16)(i&0xFFFC);
     tmp|=(UInt16)((i&0x0001)<<1);
     tmp|=(UInt16)((i&0x0002)>>1);
-    OfdmTabWrite16((UInt16)B43_OFDMTAB_GAINX,i,tmp); }
-  for(i=0x08;i<0x18;i++) OfdmTabWrite16((UInt16)B43_OFDMTAB_GAINX,i,(UInt16)(i-0x08));
+    OfdmTabWrite16(table,i,tmp); }
+  for(i=start;i<end;i++) OfdmTabWrite16(table,i,(UInt16)(i-start));
   PhyMaskSet(0x04A0,0xBFBF,0x4040);
   PhyMaskSet(0x04A1,0xBFBF,0x4040);
   PhyMaskSet(0x04A2,0xBFBF,0x4000);            /* ⚠ 0x4000 here, not 0x4040 */
@@ -1348,7 +1487,11 @@ static void CalcNrssiThreshold(void)
 
 /* ---- b43_calc_nrssi_slope. rev 2 and radio_rev 2, so: the rev >= 9 early return and the
  * radio_rev == 8 offset call do not happen, the rev >= 3 backup block and its switch do not run,
- * and every `rev >= 2` arm does. ---- */
+ * and every `rev >= 2` arm does. ----
+ * ⚠⚠ k244: EXCEPT ON THE REV-1 G-PHY (gShimIsV3). b43legacy gates every 0x0811/0x0812 access here on
+ *   `phy->rev >= 2` (radio.c:689, 721, 761) and the PHY 0x0003 write on `analog >= 2` (radio.c:709).
+ *   Those are the RFOVER/RFOVERVAL registers b43legacy and Apple's wl never touch on rev 1 -- the same
+ *   class as RadioInit2050's override block, which is where k243 most likely froze. */
 static void CalcNrssiSlope(void)
 {
   UInt16 b0,b1,b2,b3,b4,b5,b6,b7,b8,b9;
@@ -1367,8 +1510,9 @@ static void CalcNrssiSlope(void)
   RadioSet(0x007A,0x0070);
   SetAllGains(0,8,0);
   RadioMaskSet(0x007A,0x00F7,0);
-  PhyMaskSet(0x0811,0xFFCF,0x0030);            /* rev >= 2 */
-  PhyMaskSet(0x0812,0xFFCF,0x0010);
+  if(!gShimIsV3){                              /* rev >= 2 (b43legacy radio.c:689) */
+    PhyMaskSet(0x0811,0xFFCF,0x0030);
+    PhyMaskSet(0x0812,0xFFCF,0x0010); }
   RadioSet(0x007A,0x0080);
   SsbSpinUs(20);
 
@@ -1376,13 +1520,14 @@ static void CalcNrssiSlope(void)
   if(n0>=0x0020) n0=(SInt16)(n0-0x0040);
 
   RadioMaskSet(0x007A,0x007F,0);
-  PhyMaskSet(0x0003,0xFF9F,0x0040);            /* rev >= 2 */
+  if(!gShimIsV3) PhyMaskSet(0x0003,0xFF9F,0x0040);   /* analog >= 2 (b43legacy radio.c:709) */
   ssb_w16(gBus.bar0,B43_MMIO_CHANNEL_EXT,
           (UInt16)(ssb_r16(gBus.bar0,B43_MMIO_CHANNEL_EXT)|0x2000));
   RadioSet(0x007A,0x000F);
   PhyWrite(0x0015,0xF330);
-  PhyMaskSet(0x0812,0xFFCF,0x0020);            /* rev >= 2 */
-  PhyMaskSet(0x0811,0xFFCF,0x0020);
+  if(!gShimIsV3){                              /* rev >= 2 (b43legacy radio.c:721) */
+    PhyMaskSet(0x0812,0xFFCF,0x0020);
+    PhyMaskSet(0x0811,0xFFCF,0x0020); }
 
   SetAllGains(3,0,1);
   /* radio_rev != 8 */
@@ -1404,8 +1549,9 @@ static void CalcNrssiSlope(void)
   if(n0>=-4){ gNrssi0=n1; gNrssi1=n0; }
 
   /* rev >= 3 restore block: NOT run */
-  PhyMaskSet(0x0812,0xFFCF,0);                 /* rev >= 2 */
-  PhyMaskSet(0x0811,0xFFCF,0);
+  if(!gShimIsV3){                              /* rev >= 2 (b43legacy radio.c:761) */
+    PhyMaskSet(0x0812,0xFFCF,0);
+    PhyMaskSet(0x0811,0xFFCF,0); }
 
   RadioWrite(0x007A,b0); RadioWrite(0x0052,b1); RadioWrite(0x0043,b2);
   ssb_w16(gBus.bar0,B43_MMIO_PHY_RADIO,b7);
@@ -1484,7 +1630,10 @@ static void SetTxpowerG(UInt16 bb,UInt16 rf,UInt8 txctl)
   } else {
     RadioMaskSet(0x0052,0xFFF0,0);               /* stmt 4, !has_tx_magnification, tx_bias 0 */
   }
-  LoGAdjust(NULL,&outer,&steps);                 /* stmt 5 -- the piece i2 could not reach */
+  /* stmt 5 -- lo_g_adjust. DEFERRED for the rev-1 path (BCM4306/2): LoGAdjust -> LoMeasureSetupPrefix
+   * runs a rev>=2 ANALOGOVER/RFOVER block and a dummy transmission that are not for rev-1, so LO
+   * calibration is a follow-up increment (like the 4318's tx_magn). rev>=5 (4306/3, 4318) unchanged. */
+  if(!gShimIsV3) LoGAdjust(NULL,&outer,&steps);
 }
 
 /* b43_hardware_pctl_early_init. has_hardware_pctl is FALSE (rev 2 < 6), so the early-return arm
@@ -1527,6 +1676,83 @@ static void PhyInitPctl(void)
   SetTxpowerG(oldBb,oldRf,oldTxctl);             /* restore */
   HardwarePctlInitGphy();
   ShmClearTssi();
+}
+
+/* ★ b43legacy_phy_initb5 -- the rev-1 G-PHY baseband init, the branch b43_phy_initg takes when
+ * phy->rev == 1 (our BCM4306/2). Ported from b43legacy phy.c:526-639 + b43 phy_g.c:1480, whose
+ * analog-1 arms are byte-identical; the b43legacy-only PHY 0x5B/0x5C = 0 writes are included because
+ * our firmware is b43legacy's v3 ucode4. radio_ver 0x2050, analog 1, gmode TRUE (b43legacy, unlike
+ * b43, does NOT force gmode off for rev 1). The closing set_txpower_g defers lo_g_adjust on the rev-1
+ * path (SetTxpowerG skips it when gShimIsV3); LO calibration is a TX-tuning follow-up.
+ * ⚠ ORACLE: cross-check these register writes against the kext's _wlc_gphy_init before the first boot. */
+static void PhyInitB5(void)
+{
+  UInt16 off,value;
+  UInt8  oldChannel,txctl;
+
+  /* b43 prepare_hardware defaults, computed from the ACTUAL radio rev. ⚠ ORACLE/k239: the test card's radio is
+   * 2050 rev 2 (raw 0x2205017F), NOT rev 1 as first assumed -- so these must be the rev-2 defaults:
+   * bbatt 0 (2050 rev<6); rfatt via DefaultRadioAtt (3 or 4 by chipId; non-BCM Apple board, so the
+   * vendor/type args are moot); tx_control PA2DB (0x20 for rev 2, NOT the 0x30 that is rev-1 only). */
+  bbAttG = DefaultBasebandAtt(gShimRadioVer,gShimRadioRev);          /* 0 (2050 rev<6) */
+  rfAttG = DefaultRadioAtt_2050rev2_G(gBus.chipId,0,0,0);            /* 3 or 4 (radio rev 2) */
+  txctl  = (UInt8)DefaultTxControlRaw(gShimRadioVer,gShimRadioRev);  /* 0x20 = PA2DB (radio rev 2) */
+
+  /* ★ k244 marks. ⚠ The first one names radio 0x7A on purpose: initb6 writes PHY 0x003E before it ever
+   *   touches 0x7A, because on the rev-2+ cards a 0x7A access ahead of that write master-aborted (g1,
+   *   g2, g3, h1, h2 -- see the note at the top of the initb6 body below). initb5 has no such write in
+   *   b43 or b43legacy, so this access is faithful -- and it is also the one to watch. */
+  AP_PHY_MARK("  [k244] >> initb5: radio 0x7A |= 0x50 (initb5's first access; no PHY 0x3E write before it)");
+  RadioSet(0x007A,0x0050);                        /* analog == 1 */
+  /* board is Apple (not BCM, not BU4306) -> the 0xA8..0xC6 ramp (phy.c:559-566) */
+  AP_PHY_MARK("  [k244] >> initb5: PHY 0xA8-0xC6 ramp, PHY 0x35, PHY 0x38");
+  value=0x2120;
+  for(off=0x00A8;off<0x00C7;off++){ PhyWrite(off,value); value=(UInt16)(value+0x0202); }
+  PhyMaskSet(0x0035,0xF0FF,0x0700);
+  PhyWrite(0x0038,0x0667);                        /* radio_ver == 0x2050 */
+
+  /* gmode block (TRUE for rev 1 under b43legacy) */
+  AP_PHY_MARK("  [k244] >> initb5: gmode block (radio 0x7A/0x51, MMIO PHY_RADIO, PHY 0x802 0x42B 0x1C 0x13 0x35 0x5D 0x5B 0x5C)");
+  RadioSet(0x007A,0x0020);                        /* radio_ver == 0x2050 */
+  RadioSet(0x0051,0x0004);
+  ssb_w16(gBus.bar0,B43_MMIO_PHY_RADIO,0x0000);
+  PhySet(0x0802,0x0100);
+  PhySet(0x042B,0x2000);
+  PhyWrite(0x001C,0x186A);
+  PhyMaskSet(0x0013,0x00FF,0x1900);
+  PhyMaskSet(0x0035,0xFFC0,0x0064);
+  PhyMaskSet(0x005D,0xFF80,0x000A);
+  PhyWrite(0x005B,0x0000);                        /* b43legacy-only (phy.c:575-576) */
+  PhyWrite(0x005C,0x0000);
+
+  /* analog == 1 */
+  AP_PHY_MARK("  [k244] >> initb5: analog-1 PHY 0x26 0x21 0x22 0x23 0x24 0x30, MMIO 0x3EC, PHY 0x20");
+  PhyWrite(0x0026,0xCE00); PhyWrite(0x0021,0x3763); PhyWrite(0x0022,0x1BC3);
+  PhyWrite(0x0023,0x06F9); PhyWrite(0x0024,0x037E);
+  PhyWrite(0x0030,0x00C6);
+  ssb_w16(gBus.bar0,0x03ECUL,0x3F22);             /* b43_write16(dev, 0x03EC, 0x3F22) */
+  PhyWrite(0x0020,0x3E1C);                        /* analog == 1 (else 0x301C) */
+
+  oldChannel=1;                                   /* phy->channel; RadioOn(1) set it (as LoMeasureSetupPrefix) */
+  AP_PHY_MARK("  [k244] >> initb5: channel 7, radio 0x50 0x5A 0x5B 0x5C 0x7A, channel back");
+  /* ⚠ k244: b43legacy forces and restores the channel with radio_selectchannel (phy.c:605, 626), which
+   *   ends with msleep(8) (radio.c:1762) so the synthesizer settles before the radio writes that follow.
+   *   b43's gphy_channel_switch, which this was ported from, has no such wait. */
+  GphyChannelSwitch(7,0);                          /* force channel 7 for the radio writes */
+  SsbSpinUs(8000);
+  RadioWrite(0x0050,0x0020); RadioWrite(0x0050,0x0023);   /* radio_ver==0x2050: skip the 0x75/0x79 writes */
+  RadioWrite(0x0050,0x0020); RadioWrite(0x005A,0x0070);   /* radio_ver == 0x2050 */
+  RadioWrite(0x005B,0x007B); RadioWrite(0x005C,0x00B0);
+  RadioSet(0x007A,0x0007);
+  GphyChannelSwitch(oldChannel,0);                /* restore */
+  SsbSpinUs(8000);
+
+  AP_PHY_MARK("  [k244] >> initb5: PHY 0x14 0x32 0x2A, then SetTxpowerG(defaults)");
+  PhyWrite(0x0014,0x0080); PhyWrite(0x0032,0x00CA); PhyWrite(0x002A,0x88A3);
+  SetTxpowerG(bbAttG,rfAttG,txctl);               /* b43: set_txpower_g(defaults); lo_g_adjust deferred (rev-1) */
+  AP_PHY_MARK("  [k244] >> initb5: radio 0x5D, MMIO 0x3E4");
+  RadioWrite(0x005D,0x000D);                      /* radio_ver == 0x2050 */
+  ssb_w16(gBus.bar0,0x03E4UL,(UInt16)((ssb_r16(gBus.bar0,0x03E4UL)&0xFFC0)|0x0004));
 }
 
 static int gBad=0;
@@ -1573,6 +1799,66 @@ static int ApPhyInitG(void)
       gShimRadioRev=(UInt16)((idRaw229&0xF0000000UL)>>28);
       SayH("  [k229] radio rev threaded before initb6: ver = ",gShimRadioVer,4);
       SayH("  [k229]   rev = ",gShimRadioRev,4);
+    }
+
+    /* ★★ rev-1 G-PHY dispatch (BCM4306/2, v3/b43legacy regime). b43_phy_initg does
+     *    `if (rev==1) initb5 else initb6`; the driver's inline initb6 below is the else. For rev 1 we
+     *    run initb5 + the b43legacy rev-1 initg tail and return, leaving the rev-2/rev-8 inline path
+     *    byte-identical. b43legacy gates inita AND calc_loopback_gain on `rev>=2 && gmode`, so BOTH
+     *    are SKIPPED here -- which also avoids calc_loopback_gain's rev-1 ANALOGOVER machine-check.
+     *    LO calibration (lo_g_measure / lo_g_adjust) is DEFERRED to a TX-tuning follow-up; this
+     *    increment proves the baseband + radio + RX, as the 4318 did before its tx_magn work. */
+    if(gShimIsV3){
+      Say("");
+      Say("=== b43legacy rev-1 G-PHY: initb5 (BCM4306/2) ===");
+      PhyInitB5();
+      /* ★ k244: b43legacy initg's gmode OFDM-revision block (phy.c:1007-1025), which the rev-1 path had
+       *   omitted. PHY 0x0400 is the OFDM half's own revision; b43legacy reads it in exactly this pass. */
+      AP_PHY_MARK("  [k244] >> OFDM rev check: PHY 0x0400, then 0x04C2/0x04C3(/0x04CC) by its value");
+      { UInt16 ofdmRev=(UInt16)(PhyRead(0x0400)&0x00FF);
+        SayH("  [rev1] PHY 0x0400 (OFDM PHY rev, low byte) = ",(unsigned long)ofdmRev,2);
+        if(ofdmRev==3){ PhyWrite(0x04C2,0x1816); PhyWrite(0x04C3,0x8606); }
+        if(ofdmRev==4 || ofdmRev==5){
+          PhyWrite(0x04C2,0x1816); PhyWrite(0x04C3,0x8006);
+          PhyWrite(0x04CC,(UInt16)((PhyRead(0x04CC)&0x00FF)|0x1F00)); }
+        Say((ofdmRev>=3 && ofdmRev<=5) ? "    -> 0x04C2/0x04C3 written for this OFDM rev"
+                                       : "    -> no OFDM-rev writes for this value");
+        /* rev >= 2: PHY 0x047E = 0x0078 -- not this card */ }
+      if(gShimRadioRev != 8U){
+        /* ⚠⚠ k244: b43legacy's init2050, NOT RadioInit2050 -- see RadioInit2050Legacy's note. This is
+         *   the step k243 most likely froze in: the b43 version hammers PHY 0x0811-0x0815 on rev 1. */
+        UInt16 pre2B = PhyRead(0x002B);                 /* initb5 never writes it: still the reset value */
+        AP_PHY_MARK("  [k244] >> RadioInit2050Legacy (b43legacy, gmode off: no PHY 0x0811/0x0812/0x0814/0x0815)");
+        gInitval = RadioInit2050Legacy();
+        SayH("  [rev1] radio_init2050 (b43legacy) initval = ",(unsigned long)gInitval,4);
+        SayH("    rcc (radio 0x60 table) = ",(unsigned long)gRcc,4);
+        Say1("    loop-2 passes (16 = the sweep ran out) = ",(unsigned long)gLoop2Iters);
+        Say(gInitvalFromRadio78 ? "    initval = radio 0x78 read back (the sweep ran out)"
+                                : "    initval = rcc (the sweep crossed the threshold)");
+        /* What b43legacy's core reset + second (gmode) pass leave, done by hand in one pass: PHY_RADIO
+         * bit 15 clear (initb5 left the register 0), PHY 0x002B back at its reset value, and radio 0x78 =
+         * initval (initg, phy.c:1036). */
+        ssb_w16(gBus.bar0,B43_MMIO_PHY_RADIO,(UInt16)(ssb_r16(gBus.bar0,B43_MMIO_PHY_RADIO)&0x7FFF));
+        PhyWrite(0x002B,pre2B);
+        RadioWrite(0x0078,gInitval);
+        SayH("    PHY_RADIO after = ",(unsigned long)ssb_r16(gBus.bar0,B43_MMIO_PHY_RADIO),4);
+        SayH("    PHY 0x002B restored to = ",(unsigned long)PhyRead(0x002B),4);
+        SayH("    radio 0x78 after = ",(unsigned long)RadioRead(0x0078),4);
+      }
+      /* lo_g_init: no-op (hardware pctl false, rev < 6). has_tx_magnification FALSE -> radio 0x52. */
+      AP_PHY_MARK("  [k244] >> radio 0x52, CCK 0x2E / 0x2F");
+      RadioMaskSet(0x0052,0xFFF0,0);
+      { UInt16 bfl=(UInt16)ssb_r16(gBus.bar0,SSB_SPROM_BASE1+SPROM_BFLLO);
+        PhyWrite((UInt16)B43_PHY_CCK(0x2E),(UInt16)((bfl & B43_BFL_PACTRL)?0x8075:0x807F)); }
+      PhyWrite((UInt16)B43_PHY_CCK(0x2F),0x0101);       /* rev < 2 */
+      /* gmode: lo_g_adjust + LO_MASK=0x8078 -- DEFERRED with the rest of LO calibration. */
+      AP_PHY_MARK("  [k244] >> CalcNrssiSlope");
+      CalcNrssiSlope();                                 /* nrssi (boardflags RSSI set, nrssi[0]==-1000) */
+      AP_PHY_MARK("  [k244] >> PhyInitPctl");
+      PhyInitPctl();
+      /* initg tail's chip_pkg branch: the test card is chip_package 0, so the 0x4306/pkg-2 masks do not run. */
+      Say("  === rev-1 G-PHY init complete (LO calibration deferred to a TX-tuning follow-up) ===");
+      return 1;
     }
 
     /* ================= b43_phy_initb6, from its first statement ================= */

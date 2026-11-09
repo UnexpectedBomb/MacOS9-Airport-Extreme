@@ -11,10 +11,22 @@
 #include "ap_driver_cfrg.r"    /* generated: the 3-member cfrg. Rez include is invisible to CMake --
                                 * listed in the DEPENDS of the Rez command in CMakeLists. */
 
+/* ⚠ Rez cuts a 'vers' long string at 255 bytes, so only the headline (253 bytes, measured) reaches Get
+ * Info; the two spaces after it make the cut land on blanks. Everything after them is the source
+ * record only. The development builds between 1.0b235 and this release (1.0b239d, 1.0b241d,
+ * 1.0b243d, 1.0b244d, 1.0b245d) are summarised in the "1.0b245 also" entry; their own notes are in
+ * git history. */
 resource 'vers' (1, locked) {
-    0x01, 0x99, beta, 235, verUS,
-    "1.0b235",
-    "AirPort Extreme 1.0b235 (SUPPORTS A SECOND CARD, AND FINDS MORE NETWORKS. This release adds the "
+    0x01, 0x99, beta, 245, verUS,
+    "1.0b245",
+    "AirPort Extreme 1.0b245 (SUPPORTS THE EARLIEST A1026 CARDS. The first A1026 cards use an older "
+    "BCM4306 (802.11 core rev 4) that needs older Broadcom firmware. Both firmware generations are now "
+    "built in; the driver picks the right one. Restart normally.)  "
+    "(1.0b245 also: one unconfirmed frame no longer blocks every later attempt to join until the next "
+    "restart; the driver gives its memory back when Open Transport unloads it; and the AirPort Driver Log "
+    "records the card's identity and each stage of starting it, so a card that will not start can be "
+    "diagnosed from the log. Startup takes a moment longer while the log is written.) "
+    "(1.0b235 was: SUPPORTS A SECOND CARD, AND FINDS MORE NETWORKS. This release adds the "
     "Broadcom BCM4318 -- the single-chip 802.11g card on many later Linksys adapters (PCI 14e4:4318) -- "
     "alongside the BCM4306 it already supported, and it runs at full 802.11g speed on the BCM4318. It also "
     "now scans 2.4 GHz channels 1-13 (was 1-11), so a base station on channel 12 or 13 is found. The "
@@ -173,7 +185,8 @@ resource 'vers' (1, locked) {
 };
 
 resource 'vers' (2, locked) {
-    0x01, 0x99, beta, 235, verUS,
-    "1.0b235",
-    "AirPort Extreme 1.0b235 (adds the Broadcom BCM4318 single-chip 802.11g card (PCI 14e4:4318) at full 802.11g speed, alongside the BCM4306; scans 2.4 GHz channels 1-13 so an AP on 12/13 is found)"
+    0x01, 0x99, beta, 245, verUS,
+    "1.0b245",
+    "AirPort Extreme 1.0b245 (adds the earliest A1026 cards: the older BCM4306, 802.11 core rev 4, with "
+    "its v3 firmware built in alongside the v4 firmware the later cards use)"
 };

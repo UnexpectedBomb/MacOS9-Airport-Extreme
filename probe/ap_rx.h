@@ -289,8 +289,12 @@ static void SwitchChannel(UInt8 ch)
      * 40 MHz bit with a literal `if (0)`. So the cookie is just the channel number.
      * b43 also reads the old cookie so it can restore it if the PHY switch fails. Ours cannot
      * fail -- b43_gphy_op_switch_channel's only error is a 1..14 range check that every caller
-     * here satisfies -- so there is nothing to restore and that path is not ported. */
-    ShmWrite16Shared(B43_SHM_SH_CHAN,cookie);
+     * here satisfies -- so there is nothing to restore and that path is not ported.
+     * ⚠ k244: no SHM cookie on the rev-4 core. SH_CHAN (0x00A0) is a v4-firmware word -- the v4 ucode
+     *   checks the TX header's chan_radio_code against it, and the fw3 header has no such field -- and
+     *   b43legacy never writes 0x00A0 (its radio_selectchannel is MMIO plus msleep(8), radio.c:1712-1765).
+     *   Writing a channel number into an unknown word of the v3 ucode's shared memory is not harmless. */
+    if(!gShimIsV3) ShmWrite16Shared(B43_SHM_SH_CHAN,cookie);
     GphyChannelSwitch(ch,0);
     SsbSpinUs(8000);            /* msleep(8): "wait for the radio to tune ... and stabilize" */
 }

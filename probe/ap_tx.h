@@ -29,6 +29,7 @@
 
 #include "ap_rx.h"   /* the receive layer, the ring, the descriptors, the barrier */
 #include "ap_rate.h" /* k193: OFDM PLCP, the data-rate table, the ARF -- pure, host-tested (rate_test.c) */
+#include "ap_txstat3.h" /* k245: the v3 TX-status record -> the XMITSTAT pair -- pure, host-tested (txstat3_test.c) */
 
 /* ⚠ ParseRxBuffer needs the RX header layout and the 802.11 frame offsets, and both lived
  * in airport_rx.c. Sixth extraction, sixth constants block to follow the code. */
@@ -159,6 +160,44 @@ static UInt32 gTxhShift = 0;           /* 0 for FW_HDR_351, 4 for FW_HDR_410 */
 #define TXH_351_PLCP       (100UL  + gTxhShift)   /* plcp6 */
 #define TXH_SIZE_351       (106UL  + gTxhShift)   /* == b43_txhdr_size() */
 
+/* ── fw3 (b43legacy) TX header: struct b43legacy_txhdr_fw3, 82 bytes, FIXED layout -- no phy_rate,
+ *    no extra_ft, no chan_radio_code (reference/b43legacy/xmit.h:25-43). Used for the BCM4306/2
+ *    (802.11 core rev <= 4). ⚠ The RX path needs NO fw3 variant: the DMA frame offset is 30 for BOTH
+ *    generations (B43legacy_DMA0_RX_FRAMEOFFSET == B43_DMA0_RX_FW351_FO), the rxhdr fields we read
+ *    live at offsets 0..12 (identical in fw3 and fw4), and mac_status -- the one field that differs in
+ *    width (16-bit fw3 vs 32-bit fw4) -- is not read by this driver. */
+#define TXH_FW3_MAC_CTL        0UL    /* le32 */
+#define TXH_FW3_MAC_FRAME_CTL  4UL    /* le16 */
+#define TXH_FW3_PHY_CTL        8UL    /* le16 */
+#define TXH_FW3_TX_RECEIVER   26UL    /* 6 bytes: wlhdr->addr1 */
+#define TXH_FW3_PLCP_FB       40UL    /* plcp4 (4 bytes) */
+#define TXH_FW3_DUR_FB        44UL    /* le16 */
+#define TXH_FW3_COOKIE        48UL    /* le16 */
+#define TXH_FW3_PLCP          76UL    /* plcp6 field (main) -- 76..81 fills the 82-byte struct */
+#define TXH_FW3_SIZE          82UL
+/* ★★★ k245: THE LENGTH THE DMA SENDS MUST BE THE HEADER THE BUILDER WROTE.
+ *
+ * pt2 (89a4a20) made GenerateTxHdr351 / ...Rate build the 82-byte fw3 header when gShimIsV3, but every
+ * post kept telling the TX engine the header was TXH_SIZE_351 = 106 bytes. The microcode reads its own
+ * 82-byte layout and takes EVERYTHING after it as the 802.11 frame, so each frame went out as 24 stale
+ * header-buffer bytes followed by the real frame: frame control 0x0000, addr1 = 00:00:00:00:00:00 --
+ * addressed to nobody, never ACKed, never answered. This file's own header records Stage 5 losing weeks
+ * to the mirror image (a 106-byte header read as 82). b43legacy's dma_tx_fragment passes
+ * sizeof(struct b43legacy_txhdr_fw3) for the header descriptor (dma.c:967-968, op32_fill_descriptor).
+ * The tester's k244 log cannot show it: with ring 3 unread there was no status to say what left the antenna.
+ * Every header-descriptor length in ap_shim.c uses THIS, never TXH_SIZE_351. On the fw4 path it IS
+ * TXH_SIZE_351 (106 or 110), so the 4306/3 and 4318 post exactly what they always have. */
+#define TXH_SIZE_LIVE ((UInt16)(gShimIsV3 ? TXH_FW3_SIZE : TXH_SIZE_351))
+/* ⚠ b43legacy's phy_ctl ANTENNA encoding DIFFERS from b43's -- the v3 ucode reads the field
+ * differently: ANT1 is 0x0100 and ANTLAST is 0x0300 (reference/b43legacy/xmit.h:75-78), vs b43's
+ * B43_TXH_PHY_ANT1 = 0x0040. generate_txhdr_fw3 hardcodes ANTLAST. */
+#define B43LEGACY_TX4_PHY_ANTLAST       0x0300
+#define B43LEGACY_TX4_MAC_FALLBACKOFDM  0x00000100UL   /* fw3 carries fallback-OFDM in mac_ctl, not extra_ft */
+
+/* ★ gShimIsV3 (1 for the BCM4306/2 rev-1 path) is declared in ap_phy_initg.h -- the include chain
+ * processes that file before this one's body, so the GenerateTxHdr351 / ...Rate dispatchers below
+ * and ap_phy_initg.h's own rev-1 arms share one flag. Set by ApShimLoadFirmware. */
+
 #define B43_TXH_MAC_ACK        0x00000001UL
 #define B43_TXH_MAC_HWSEQ      0x00000010UL
 #define B43_TXH_MAC_STMSDU     0x00000008UL
@@ -251,15 +290,73 @@ static const char *kAntNameV[3] = {"ANTENNA 0 (forced)","ANTENNA 1 (forced)",
  *   the return value was the one thing nobody tested.
  *
  * Now: keep draining and waiting until OUR cookie appears or the timeout expires, and return
- * that frame's ACK bit. Strictly more correct for all four callers. */
+ * that frame's ACK bit. Strictly more correct for all four callers.
+ *
+ * ⚠ k244: NOT ON THE REV-4 CORE (gShimIsV3). The v3 microcode there reports TX status through DMA
+ *   ring 3, not the XMITSTAT FIFO, and b43legacy will not touch XMITSTAT below rev 5 (main.c:737-738).
+ *   Reading it would at best wait out the whole timeout on an empty FIFO -- 600 ms before every join
+ *   step's RxWaitFor -- and at worst fault if the register is not backed on rev 4.
+ * ★ k245: SO ON THE REV-4 CORE IT READS RING 3 INSTEAD. ApTs3Pop hands back each record as the XMITSTAT
+ *   pair (ap_txstat3.h), and everything below the fetch -- the decode, the print, the cookie match -- is
+ *   the fw4 path unchanged. Only when ring 3 never armed does it still return 0 at once, which there
+ *   means UNKNOWN, not "not ACKed". gTxStatSawWanted tells a caller which of the two a 0 was. */
+
+/* ★ k245: RX RING 3, where the v3 microcode posts TX status (core rev <= 4). The ring's page, descriptors
+ * and engine are armed by ap_shim.c (ApTs3Arm, from ApShimDmaInit); these are the records' logical address
+ * and the consumer's cursor, shared by the join's poll (DrainTxStatus) and the interrupt pump
+ * (ApShimDrainTxStatQuiet). The engine FREE-RUNS (RXINDEX one past the end, as the RX ring has since k25),
+ * so it can never stall on a full ring: an unread status is overwritten a lap later, never held against
+ * the transmitter -- which matters, because an unserviced XMITSTAT FIFO stalled the fw4 transmitter (k149). */
+static UInt8        *gTs3Rec = 0;      /* AP_TS3_SLOTS records of AP_TS3_BUFSZ bytes; 0 = no ring */
+static volatile int  gTs3Armed = 0;    /* 1 = engine 3 armed, ACTIVE and RXRING read back */
+static UInt32        gTs3Cursor = 0;   /* the next record the engine should write, as far as we know */
+static UInt32        gTs3Popped = 0, gTs3PoppedIsr = 0, gTs3Acked = 0, gTs3Skipped = 0, gTs3LastV0 = 0;
+
+/* Pop the OLDEST pending record as (v0, v1). It looks at the cursor's record first. With full = 1 it then
+ * looks past empty records, the whole ring once round -- task level, where a lap of 64 two-byte reads is
+ * nothing and a cursor that disagrees with the engine must not hide a status. With full = 0 it looks at the
+ * cursor's record only: the interrupt pump, cheap and in order. Memory reads and one two-byte store per
+ * record -- no MMIO, no Say -- so it is safe at any execution level. */
+static int ApTs3Pop(UInt32 *v0, UInt32 *v1, int full)
+{
+    UInt32 i, n = full ? AP_TS3_SLOTS : 1u;
+    if(!gTs3Armed || !gTs3Rec) return 0;
+    for(i = 0; i < n; i++){
+        UInt32 slot = (gTs3Cursor + i) % AP_TS3_SLOTS;
+        UInt8 *rec = gTs3Rec + slot * AP_TS3_BUFSZ;
+        if(!ApTs3Pending(rec)) continue;
+        *v0 = ApTs3V0(rec);
+        *v1 = ApTs3V1(rec);
+        rec[AP_TS3_COOKIE] = 0; rec[AP_TS3_COOKIE + 1u] = 0;    /* consumed: empty again, as b43legacy posts it */
+        if(i) gTs3Skipped++;                                   /* found past an empty record: the cursor had drifted */
+        gTs3Cursor = (slot + 1u) % AP_TS3_SLOTS;
+        gTs3Popped++; gTs3LastV0 = *v0;
+        if(*v0 & 0x00000002UL) gTs3Acked++;
+        return 1;
+    }
+    return 0;
+}
+
+/* One TX status, from whichever source this core's microcode uses. fw4: the XMITSTAT FIFO, read exactly as
+ * since k7 (bit 0 of _0 = an entry is pending; reading _1 pops it). v3: ring 3, as the same pair. */
+static int ApTxStatNext(UInt32 *v0, UInt32 *v1)
+{
+    if(gShimIsV3) return ApTs3Pop(v0, v1, 1);
+    *v0 = ssb_r32(gBus.bar0,B43_MMIO_XMITSTAT_0);
+    if(!(*v0 & 0x00000001UL)) return 0;
+    *v1 = ssb_r32(gBus.bar0,B43_MMIO_XMITSTAT_1);
+    return 1;
+}
+
+static UInt32 gTxStatV3Skipped = 0;
+static int    gTxStatSawWanted = 0;    /* k245: the LAST DrainTxStatus saw a final status for its cookie */
 static int DrainTxStatus(UInt16 wantCookie,UInt32 waitMs)
 {
-    UInt32 v0,v1,ms; int found=0; int sawWanted=0, wantedAcked=0;
+    UInt32 v0,v1,ms; int found=0; int sawWanted=0, wantedAcked=0, sawFinal=0;
+    gTxStatSawWanted = 0;
+    if(gShimIsV3 && !gTs3Armed){ gTxStatV3Skipped++; return 0; }
     for(ms=0; ms<waitMs; ms+=10){
-      while(1){
-        v0 = ssb_r32(gBus.bar0,B43_MMIO_XMITSTAT_0);
-        if(!(v0 & 0x00000001UL)) break;
-        v1 = ssb_r32(gBus.bar0,B43_MMIO_XMITSTAT_1);
+      while(ApTxStatNext(&v0,&v1)){
         { UInt16 cookie = (UInt16)(v0 >> 16);
           UInt16 seq    = (UInt16)(v1 & 0xFFFFUL);
           UInt32 phySt  = (v1 & 0x00FF0000UL) >> 16;
@@ -276,11 +373,12 @@ static int DrainTxStatus(UInt16 wantCookie,UInt32 waitMs)
                                   sawWanted = 1;
                                   /* ⚠ an INTERMEDIATE status is not the final word on this
                                    * frame -- only a final one settles whether it was acked. */
-                                  if(!interm) wantedAcked = acked; }
+                                  if(!interm){ wantedAcked = acked; sawFinal = 1; } }
           else PCat(L,"  (not the cookie we stamped)");
           Out(L);
-          SayH("          XMITSTAT_0 = ",v0,8);
-          SayH("          XMITSTAT_1 = ",v1,8);
+          /* k245: on the rev-4 core the pair was built from a ring-3 record -- say so, not "the register". */
+          SayH(gShimIsV3 ? "          ring-3 record as XMITSTAT_0 = " : "          XMITSTAT_0 = ",v0,8);
+          SayH(gShimIsV3 ? "          ring-3 record as XMITSTAT_1 = " : "          XMITSTAT_1 = ",v1,8);
           Say1("          seq         = ",(unsigned long)seq);
           Say1("          frame_count = ",fcount);
           Say1("          rts_count   = ",rcount);
@@ -309,6 +407,7 @@ static int DrainTxStatus(UInt16 wantCookie,UInt32 waitMs)
       if(sawWanted) break;
       SsbSpinUs(10000); }
     (void)found;
+    gTxStatSawWanted = sawFinal;
     return wantedAcked;
 }
 
@@ -336,6 +435,89 @@ static void GeneratePlcpHdrCck(UInt8 *plcp,UInt16 octets,UInt8 bitrate)
 /* k193: the OFDM arm of b43_generate_plcp_hdr (GeneratePlcpHdrOfdm) lives in ap_rate.h, so the host
  * suite (rate_test.c) exercises the same code the card runs. */
 
+/* ── fw3 TX-header builders (b43legacy generate_txhdr_fw3, reference/b43legacy/xmit.c:174-343).
+ * The fw3 equivalents of GenerateTxHdr351 / ...Rate: same field VALUES (the TX4 mac_ctl bits match
+ * b43's: ACK 0x01, HWSEQ 0x10, STMSDU 0x08, ENC_CCK/OFDM 0/1) re-laid-out into the 82-byte fw3
+ * struct, with b43legacy's ANTLAST antenna code. We do software crypto, so -- like GenerateTxHdr351
+ * -- the key_idx/algorithm/iv fields are left zero. The main+fallback PLCP are computed once into a
+ * local and copied: 4 bytes to plcp_fb (a plcp4 field, so dur_fb at +44 is never clobbered) and 6 to
+ * the main plcp6 field at +76. */
+static void GenerateTxHdrFw3(UInt8 *txh,const UInt8 *frame,UInt16 frameLen,
+                             UInt8 channel,UInt16 cookie,UInt16 antSel,int ackReq)
+{
+    UInt32 mac_ctl = 0;
+    UInt16 phy_ctl = 0;
+    UInt16 fctl = le16at(frame);
+    UInt16 durId = le16at(frame+2);
+    UInt16 plcpLen = (UInt16)(frameLen + FCS_LEN);
+    UInt8 plcp[6];
+    int i;
+
+    for(i=0;i<(int)TXH_FW3_SIZE;i++) txh[i]=0;      /* memset(txhdr, 0, sizeof(*txhdr)) */
+
+    le16st(txh+TXH_FW3_MAC_FRAME_CTL,fctl);
+    for(i=0;i<6;i++) txh[TXH_FW3_TX_RECEIVER+i] = frame[4+i];   /* wlhdr->addr1 */
+    le16st(txh+TXH_FW3_DUR_FB,durId);               /* rate_fb == rate: copy duration_id verbatim */
+
+    GeneratePlcpHdrCck(plcp,plcpLen,B43_CCK_RATE_1MB);
+    for(i=0;i<4;i++) txh[TXH_FW3_PLCP_FB+i] = plcp[i];          /* plcp_fb: plcp4 (4 bytes) */
+    for(i=0;i<6;i++) txh[TXH_FW3_PLCP   +i] = plcp[i];          /* main plcp6 (@76..81) */
+
+    phy_ctl |= B43_TXH_PHY_ENC_CCK;
+    phy_ctl |= B43LEGACY_TX4_PHY_ANTLAST;           /* b43legacy hardcodes ANTLAST for fw3 */
+
+    if(ackReq) mac_ctl |= B43_TXH_MAC_ACK;
+    mac_ctl |= B43_TXH_MAC_HWSEQ;
+    mac_ctl |= B43_TXH_MAC_STMSDU;
+
+    le16st(txh+TXH_FW3_COOKIE,cookie);
+    le32st(txh+TXH_FW3_MAC_CTL,mac_ctl);
+    le16st(txh+TXH_FW3_PHY_CTL,phy_ctl);
+    (void)channel; (void)antSel;    /* fw3 has no chan_radio_code; antenna is ANTLAST */
+}
+
+/* fw3 data-frame builder with a real main rate -- the fw3 equivalent of GenerateTxHdr351Rate. fw3
+ * has no extra_ft byte, so the fallback-OFDM flag goes into mac_ctl (B43legacy_TX4_MAC_FALLBACKOFDM)
+ * rather than extra_ft; rate lives only in the PLCP (no phy_rate byte). */
+static void GenerateTxHdrFw3Rate(UInt8 *txh,const UInt8 *frame,UInt16 frameLen,
+                                 UInt8 channel,UInt16 cookie,UInt16 antSel,int ackReq,
+                                 int ofdm,UInt8 ratecode,int fbOfdm,UInt8 fbCode)
+{
+    UInt32 mac_ctl = 0;
+    UInt16 phy_ctl = 0;
+    UInt16 fctl = le16at(frame);
+    UInt16 durId = le16at(frame+2);
+    UInt16 plcpLen = (UInt16)(frameLen + FCS_LEN);
+    UInt8 mplcp[6], fplcp[6];
+    int i;
+
+    for(i=0;i<(int)TXH_FW3_SIZE;i++) txh[i]=0;
+
+    le16st(txh+TXH_FW3_MAC_FRAME_CTL,fctl);
+    for(i=0;i<6;i++) txh[TXH_FW3_TX_RECEIVER+i] = frame[4+i];
+    le16st(txh+TXH_FW3_DUR_FB,durId);
+
+    if(ofdm)   GeneratePlcpHdrOfdm(mplcp,plcpLen,ratecode);
+    else       GeneratePlcpHdrCck (mplcp,plcpLen,B43_CCK_RATE_1MB);
+    if(fbOfdm) GeneratePlcpHdrOfdm(fplcp,plcpLen,fbCode);
+    else       GeneratePlcpHdrCck (fplcp,plcpLen,B43_CCK_RATE_1MB);
+    for(i=0;i<4;i++) txh[TXH_FW3_PLCP_FB+i] = fplcp[i];
+    for(i=0;i<6;i++) txh[TXH_FW3_PLCP   +i] = mplcp[i];
+
+    phy_ctl |= ofdm ? B43_TXH_PHY_ENC_OFDM : B43_TXH_PHY_ENC_CCK;
+    phy_ctl |= B43LEGACY_TX4_PHY_ANTLAST;
+
+    if(ackReq) mac_ctl |= B43_TXH_MAC_ACK;
+    mac_ctl |= B43_TXH_MAC_HWSEQ;
+    mac_ctl |= B43_TXH_MAC_STMSDU;
+    if(fbOfdm) mac_ctl |= B43LEGACY_TX4_MAC_FALLBACKOFDM;
+
+    le16st(txh+TXH_FW3_COOKIE,cookie);
+    le32st(txh+TXH_FW3_MAC_CTL,mac_ctl);
+    le16st(txh+TXH_FW3_PHY_CTL,phy_ctl);
+    (void)channel; (void)antSel;
+}
+
 /* b43_generate_txhdr, our live path only. */
 static void GenerateTxHdr351(UInt8 *txh,const UInt8 *frame,UInt16 frameLen,
                              UInt8 channel,UInt16 cookie,UInt16 antSel,int ackReq)
@@ -346,6 +528,8 @@ static void GenerateTxHdr351(UInt8 *txh,const UInt8 *frame,UInt16 frameLen,
     UInt16 durId = le16at(frame+2);
     UInt16 plcpLen = (UInt16)(frameLen + FCS_LEN);
     int i;
+
+    if(gShimIsV3){ GenerateTxHdrFw3(txh,frame,frameLen,channel,cookie,antSel,ackReq); return; }
 
     for(i=0;i<(int)TXH_SIZE_351;i++) txh[i]=0;      /* memset(txhdr, 0, sizeof(*txhdr)) */
 
@@ -414,6 +598,9 @@ static void GenerateTxHdr351Rate(UInt8 *txh,const UInt8 *frame,UInt16 frameLen,
     UInt16 durId = le16at(frame+2);
     UInt16 plcpLen = (UInt16)(frameLen + FCS_LEN);
     int i;
+
+    if(gShimIsV3){ GenerateTxHdrFw3Rate(txh,frame,frameLen,channel,cookie,antSel,ackReq,
+                                        ofdm,ratecode,fbOfdm,fbCode); return; }
 
     for(i=0;i<(int)TXH_SIZE_351;i++) txh[i]=0;
 

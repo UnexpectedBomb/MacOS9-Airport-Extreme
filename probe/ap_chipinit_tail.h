@@ -178,6 +178,20 @@ static void GphySetRxAntenna(int antenna,UInt16 phyRev)
 static void MgmtFrameTxAntenna(void)
 {
     UInt16 ant = B43_TXH_PHY_ANT01AUTO, tmp;
+    /* ⚠ k244: THE v3 MICROCODE ENCODES THE ANTENNA DIFFERENTLY inside the same 0x03C0 field: ANT0 0x0000,
+     *   ANT1 0x0100, ANTLAST 0x0300, and no ANT01AUTO (b43legacy xmit.h:75-78) -- 0x00C0 means nothing to
+     *   it. These words are what the ucode builds its ACKs from, so on the rev-4 core this follows
+     *   b43legacy_mgmtframe_txantenna(DEFAULT = AUTO) instead (main.c:2093-2134): ANTLAST, the same value
+     *   the fw3 TX header already uses, read-modify-written into all three words, beacon included. */
+    if(gShimIsV3){
+        static const UInt32 kWords[3] = { 0x0054UL, B43_SHM_SH_ACKCTSPHYCTL, B43_SHM_SH_PRPHYCTL };
+        int w;                                        /* 0x0054 = B43legacy_SHM_SH_BEACPHYCTL (b43legacy.h:136) */
+        for(w = 0; w < 3; w++){
+            tmp = ShmRead16Shared(kWords[w]);
+            tmp = (UInt16)((tmp & ~B43_TXH_PHY_ANT) | 0x0300);   /* B43legacy_TX4_PHY_ANTLAST */
+            ShmWrite16Shared(kWords[w],tmp); }
+        return;
+    }
     tmp = ShmRead16Shared(B43_SHM_SH_ACKCTSPHYCTL);
     tmp = (UInt16)((tmp & ~B43_TXH_PHY_ANT) | ant);
     ShmWrite16Shared(B43_SHM_SH_ACKCTSPHYCTL,tmp);
