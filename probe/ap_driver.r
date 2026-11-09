@@ -6,26 +6,38 @@
  * OT scans this cfrg at boot, calls the scanner's OTScanPorts, and installs the driver itself. This is
  * the shape of Apple's `Apple Enet DLPI Support`, verified fragment-for-fragment.
  *
- * ⚠ STANDING (user): both version strings carry the build so Get Info shows the installed build. */
+ * ⚠ STANDING (user, 2026-11-09, replacing the older "both version strings carry the build" rule): the public
+ *   version is a plain number for end users ("call this version 2.0 for the sake of simplicity"), and Get Info
+ *   shows THE VERSION ONLY: no description, no changelog, no build number. 2.0 = build 245. The build stays
+ *   visible where diagnosis needs it: the driver log's "OTMODL build NNN" and the panel's About box. */
 #include "Types.r"
 #include "ap_driver_cfrg.r"    /* generated: the 3-member cfrg. Rez include is invisible to CMake --
                                 * listed in the DEPENDS of the Rez command in CMakeLists. */
 
-/* ⚠ Rez cuts a 'vers' long string at 255 bytes, so only the headline (253 bytes, measured) reaches Get
- * Info; the two spaces after it make the cut land on blanks. Everything after them is the source
- * record only. The development builds between 1.0b235 and this release (1.0b239d, 1.0b241d,
- * 1.0b243d, 1.0b244d, 1.0b245d) are summarised in the "1.0b245 also" entry; their own notes are in
- * git history. */
+/* ⚠ WHAT EACH SURFACE READS (observed in QEMU on OS 9.2.2, 2026-11-09): Get Info's "Version:" line = vers 1's
+ * LONG string (about two lines shown) and the line under the name = vers 2's LONG string; Extensions Manager's
+ * Version column = vers 1's SHORT string and its Package column = vers 2's LONG string (1.0b245's 170-character
+ * package text showed as "-"); Apple System Profiler's list = the NUMERIC bytes. So all three must agree:
+ * vers 1 is the bare version, vers 2 is the product name, as Apple's own "AirPort 2.0" is. Until 2.0 the
+ * numeric was 0x01,0x99: left over from k198/k199 using those bytes as a build counter, which ASP displayed
+ * as "1.9.9b245". */
 resource 'vers' (1, locked) {
-    0x01, 0x99, beta, 245, verUS,
-    "1.0b245",
-    "AirPort Extreme 1.0b245 (SUPPORTS THE EARLIEST A1026 CARDS. The first A1026 cards use an older "
+    0x02, 0x00, 0x80, 0x00, verUS,
+    "2.0",
+    "2.0"
+};
+
+/* RELEASE HISTORY: source record only, never compiled (#if 0). Until 2.0 this text was vers 1's long string,
+ * and Rez kept only its first 255 bytes. The development builds between 1.0b235 and 2.0 (1.0b239d, 1.0b241d,
+ * 1.0b243d, 1.0b244d, 1.0b245d) are summarised in the 2.0 entry; their own notes are in git history. */
+#if 0
+    "(2.0, build 245: SUPPORTS THE EARLIEST A1026 CARDS. The first A1026 cards use an older "
     "BCM4306 (802.11 core rev 4) that needs older Broadcom firmware. Both firmware generations are now "
-    "built in; the driver picks the right one. Restart normally.)  "
-    "(1.0b245 also: one unconfirmed frame no longer blocks every later attempt to join until the next "
-    "restart; the driver gives its memory back when Open Transport unloads it; and the AirPort Driver Log "
-    "records the card's identity and each stage of starting it, so a card that will not start can be "
-    "diagnosed from the log. Startup takes a moment longer while the log is written.) "
+    "built in, and the driver picks the right one. Also: one unconfirmed frame no longer blocks every later "
+    "attempt to join until the next restart; the driver gives its memory back when Open Transport unloads "
+    "it; and the AirPort Driver Log records the card's identity and each stage of starting it, so a card "
+    "that will not start can be diagnosed from the log. Startup takes a moment longer while the log is "
+    "written. Restart normally.) "
     "(1.0b235 was: SUPPORTS A SECOND CARD, AND FINDS MORE NETWORKS. This release adds the "
     "Broadcom BCM4318 -- the single-chip 802.11g card on many later Linksys adapters (PCI 14e4:4318) -- "
     "alongside the BCM4306 it already supported, and it runs at full 802.11g speed on the BCM4318. It also "
@@ -182,11 +194,10 @@ resource 'vers' (1, locked) {
     "driver log now goes to the System Folder via FindFolder -- k189 run 2 scattered three copies across "
     "System Folder, Control Panels and Extensions. Keeps k189's module_info alignment fix. "
     "⚠ COLD boot required.)"
-};
+#endif
 
 resource 'vers' (2, locked) {
-    0x01, 0x99, beta, 245, verUS,
-    "1.0b245",
-    "AirPort Extreme 1.0b245 (adds the earliest A1026 cards: the older BCM4306, 802.11 core rev 4, with "
-    "its v3 firmware built in alongside the v4 firmware the later cards use)"
+    0x02, 0x00, 0x80, 0x00, verUS,
+    "2.0",
+    "AirPort Extreme 2.0"
 };

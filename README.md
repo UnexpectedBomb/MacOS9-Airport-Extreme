@@ -58,8 +58,8 @@ G4s that took the discrete **A1026** card: all are expected to work, but only th
 confirmed.
 
 **The earliest A1026 cards are supported too.** Some of the first A1026 cards use an older revision of
-the BCM4306 chip (802.11 core revision 4) that needs older Broadcom firmware. Releases before 1.0b245
-could not start it; 1.0b245 carries both firmware generations and picks the right one for the card. It is
+the BCM4306 chip (802.11 core revision 4) that needs older Broadcom firmware. Releases before 2.0
+could not start it; 2.0 carries both firmware generations and picks the right one for the card. It is
 confirmed on a 17-inch 1.0GHz PowerBook G4 (PowerBook5,1), joining a WPA2 network and browsing the web.
 
 
