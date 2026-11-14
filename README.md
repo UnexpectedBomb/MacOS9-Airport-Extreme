@@ -83,7 +83,7 @@ AIRPORT EXTREME (A1026) COMPATIBLE G4 MACS
 | Al PowerBook G4 15" 1.33/1.5GHz | PowerBook5,4 | Unconfirmed |
 | Al PowerBook G4 17" 1.5GHz | PowerBook5,5 | Yes¹ |
 | Al PowerBook G4 15" 1.5/1.67GHz | PowerBook5,6 | Unconfirmed |
-| Al PowerBook G4 17" 1.67GHz | PowerBook5,7 | Unconfirmed |
+| Al PowerBook G4 17" 1.67GHz | PowerBook5,7 | Yes |
 
 ¹ On the reported PowerBook5,5, keep Apple's **AirPort AP Support** extension installed; see
 [Coexistence](#coexistence-with-apples-airport-software).
