@@ -491,11 +491,25 @@ int main(void)
       checkb("CCMP encap: the ciphertext is not the plaintext",
             memcmp(frame + 24 + 8, body, 16) != 0);
       checkb("CCMP encap -> decap: the MIC verifies",
-            ApCcmpDecap(frame,flen,tk,back,&blen,gotPn,&kid) == 1);
+            ApCcmpDecap(frame,flen,tk,back,(ApU32)sizeof back,&blen,gotPn,&kid) == 1);
       checkb("CCMP encap -> decap: the plaintext comes back byte for byte",
             blen == 16 && !memcmp(back,body,16));
       checkb("CCMP encap -> decap: the PN comes back",   !memcmp(gotPn,pn,6));
       checkb("CCMP encap -> decap: the key id comes back", kid == 1);
+
+      { /* ⛔ 2.0.1: THE OUTPUT CAPACITY IS ENFORCED BEFORE ANYTHING IS DECRYPTED. CCM decrypts first
+         * and checks the MIC after, so through 2.0 an oversized frame wrote its whole payload into a
+         * smaller buffer even when its MIC was garbage. One byte too small must be refused with the
+         * buffer untouched; an exact fit must still decrypt. */
+        ApU8 small[32]; ApU32 i, untouched = 1;
+        memset(small, 0x5A, sizeof small);
+        checkb("CCMP 2.0.1: capacity one byte short -> refused",
+              ApCcmpDecap(frame,flen,tk,small,15u,&blen,gotPn,&kid) == 0);
+        for(i = 0; i < (ApU32)sizeof small; i++) if(small[i] != 0x5A) untouched = 0;
+        checkb("CCMP 2.0.1: ...and not one byte of the buffer was written", untouched);
+        checkb("CCMP 2.0.1: capacity exactly the payload -> decrypts",
+              ApCcmpDecap(frame,flen,tk,small,16u,&blen,gotPn,&kid) == 1 &&
+              blen == 16 && !memcmp(small,body,16)); }
 
       { /* ★ AND THE RECEIVER MUST REJECT OUR OWN FRAME IF IT IS TOUCHED. Without this the
          * round trip only shows the two halves agree, not that either one authenticates. */
@@ -503,11 +517,11 @@ int main(void)
         memcpy(t,frame,(size_t)flen); tl = flen;
         t[24+8+3] ^= 0x01;                                  /* flip a ciphertext bit */
         checkb("CCMP: a tampered payload in OUR OWN frame is rejected",
-              ApCcmpDecap(t,tl,tk,back,&blen,gotPn,&kid) == 0);
+              ApCcmpDecap(t,tl,tk,back,(ApU32)sizeof back,&blen,gotPn,&kid) == 0);
         memcpy(t,frame,(size_t)flen);
         t[16] ^= 0x01;                                      /* flip a bit in A3, inside the AAD */
         checkb("CCMP: a tampered ADDRESS in OUR OWN frame is rejected",
-              ApCcmpDecap(t,tl,tk,back,&blen,gotPn,&kid) == 0); } }
+              ApCcmpDecap(t,tl,tk,back,(ApU32)sizeof back,&blen,gotPn,&kid) == 0); } }
 
     /* ★★★★★ 8-36: A REALISTIC FRAME LENGTH, AGAINST AN INDEPENDENT IMPLEMENTATION.
      *

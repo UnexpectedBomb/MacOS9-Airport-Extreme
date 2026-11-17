@@ -5120,13 +5120,15 @@ int main(void)
                                                  * because it can only verify for the correct
                                                  * length. So try both and report which. */
                                                 okA = ApCcmpDecap((const ApU8*)df,(ApU32)dlen,k,
-                                                                  (ApU8*)plain,&plen,pn,&kid);
+                                                                  (ApU8*)plain,(ApU32)sizeof plain,
+                                                                  &plen,pn,&kid);
                                                 if(okA){
                                                   Say("      ★ MIC VERIFIED with frame_len AS GIVEN");
                                                   Say("        -> the card does NOT include the FCS.");
                                                 } else if(dlen > 4){
                                                   okB = ApCcmpDecap((const ApU8*)df,(ApU32)(dlen-4),k,
-                                                                    (ApU8*)plain,&plen,pn,&kid);
+                                                                    (ApU8*)plain,(ApU32)sizeof plain,
+                                                                    &plen,pn,&kid);
                                                   if(okB){
                                                     Say("      ★ MIC VERIFIED with frame_len MINUS 4");
                                                     Say("        -> the card DOES include the FCS, and");
@@ -5336,7 +5338,8 @@ int main(void)
                                               if(rlen <= 4) continue;
                                               if(!ApCcmpDecap((const ApU8*)rf,(ApU32)(rlen-4),
                                                               rkey,
-                                                              (ApU8*)rplain,&rplen,rpn,&rkid)){
+                                                              (ApU8*)rplain,(ApU32)sizeof rplain,
+                                                              &rplen,rpn,&rkid)){
                                                 Say("        ...did not decrypt with that key");
                                                 continue; }
                                               arp81Decrypted++;

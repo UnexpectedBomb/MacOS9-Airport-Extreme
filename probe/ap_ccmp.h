@@ -284,9 +284,16 @@ static ApU32 ApCcmpAad(const ApU8 *hdr,int isMgmt,int a4,ApU8 qosTid,int isQos,A
  *   frameLen its total length, INCLUDING the header, CCMP header and MIC
  *   key      the 16-byte TK (unicast) or GTK (group)
  *   out      receives the plaintext payload; outLen its length
- * Returns 1 if the MIC verified. 0 means discard the frame and do not look at `out`. */
+ *   outCap   the capacity of `out` in bytes
+ * Returns 1 if the MIC verified. 0 means discard the frame and do not look at `out`.
+ *
+ * ⛔⛔ 2.0.1: `outCap` IS CHECKED BEFORE A SINGLE BYTE IS DECRYPTED. CCM decrypts first and checks
+ *   the MIC afterwards (ApAesCcmDecryptCtx), so through 2.0 a forged frame with a garbage MIC still
+ *   wrote its whole payload: ApRxToEnet's 2048-byte gApEnetPlain against frames of up to ~2308
+ *   payload bytes, ~260 bytes of overrun at secondary interrupt level by anyone in range, no key
+ *   needed. Every caller now states its buffer's size, and an oversized frame is refused here. */
 static int ApCcmpDecap(const ApU8 *frame,ApU32 frameLen,const ApU8 *key,
-                       ApU8 *out,ApU32 *outLen,ApU8 *pnOut,int *keyIdOut)
+                       ApU8 *out,ApU32 outCap,ApU32 *outLen,ApU8 *pnOut,int *keyIdOut)
 {
     ApU8 nonce[13], aad[32], pn[6];
     ApU32 fc = (ApU32)frame[0] | ((ApU32)frame[1] << 8);
@@ -310,6 +317,7 @@ static int ApCcmpDecap(const ApU8 *frame,ApU32 frameLen,const ApU8 *key,
     ApCcmpNonce(frame,pn,isMgmt,qosTid,nonce);
     aadLen  = ApCcmpAad(frame,isMgmt,a4,qosTid,isQos,aad);
     dataLen = frameLen - hdrLen - CCMP_HDR_LEN - CCMP_MIC_LEN;
+    if(dataLen > outCap) return 0;                     /* 2.0.1: never decrypt past the buffer */
 
     if(!ApAesCcmDecrypt(key,nonce,aad,aadLen,
                         frame + hdrLen + CCMP_HDR_LEN, dataLen,

@@ -8,8 +8,14 @@
  *
  * ⚠ STANDING (user, 2026-11-09, replacing the older "both version strings carry the build" rule): the public
  *   version is a plain number for end users ("call this version 2.0 for the sake of simplicity"), and Get Info
- *   shows THE VERSION ONLY: no description, no changelog, no build number. 2.0 = build 245. The build stays
- *   visible where diagnosis needs it: the driver log's "OTMODL build NNN" and the panel's About box. */
+ *   shows THE VERSION ONLY: no description, no changelog, no build number. 2.0 = build 245, 2.0.1 = build
+ *   247 (build 246 was 2.0.1's first candidate, held back by the user on 2026-11-16 so that one release would
+ *   carry both its security fixes and the idle-sleep fix). The build stays visible where diagnosis needs it:
+ *   the driver log's "OTMODL build NNN" and the panel's About box.
+ * ⚠ DEVELOPMENT BUILDS carry their build in the STRINGS, as 1.0b239d..1.0b245d did, so that Get Info tells a
+ *   test build from the release it sits on (build 247 was tested as "2.0.1b247d"). A release goes back to the
+ *   plain number in both strings and changes nothing else: 2.0.1's data fork is byte-identical to the tested
+ *   2.0.1b247d's. The NUMERIC bytes are the user's call. */
 #include "Types.r"
 #include "ap_driver_cfrg.r"    /* generated: the 3-member cfrg. Rez include is invisible to CMake --
                                 * listed in the DEPENDS of the Rez command in CMakeLists. */
@@ -22,15 +28,23 @@
  * numeric was 0x01,0x99: left over from k198/k199 using those bytes as a build counter, which ASP displayed
  * as "1.9.9b245". */
 resource 'vers' (1, locked) {
-    0x02, 0x00, 0x80, 0x00, verUS,
-    "2.0",
-    "2.0"
+    0x02, 0x01, 0x80, 0x00, verUS,
+    "2.0.1",
+    "2.0.1"
 };
 
 /* RELEASE HISTORY: source record only, never compiled (#if 0). Until 2.0 this text was vers 1's long string,
  * and Rez kept only its first 255 bytes. The development builds between 1.0b235 and 2.0 (1.0b239d, 1.0b241d,
  * 1.0b243d, 1.0b244d, 1.0b245d) are summarised in the 2.0 entry; their own notes are in git history. */
 #if 0
+    "(2.0.1, build 247: SECURITY FIXES, AND IDLE SLEEP ON AIRPORT. A data frame too large for the receive "
+    "buffer is refused before it is decrypted (2.0 could overwrite driver memory with one forged frame from "
+    "anyone in range); a handshake message 3 that fails its check ends the join attempt instead of completing "
+    "it; replayed or duplicate encrypted frames are dropped; and on a secured network, unencrypted data frames "
+    "are dropped instead of passed to TCP/IP. The Mac can now take its idle sleep while TCP/IP is on AirPort "
+    "Extreme: the driver asked Mac OS for time every 5 seconds, which counted as activity and kept the Mac "
+    "awake, and now asks only when it has work. The log gets a line when something happens, not every 30 s. "
+    "Restart normally.) "
     "(2.0, build 245: SUPPORTS THE EARLIEST A1026 CARDS. The first A1026 cards use an older "
     "BCM4306 (802.11 core rev 4) that needs older Broadcom firmware. Both firmware generations are now "
     "built in, and the driver picks the right one. Also: one unconfirmed frame no longer blocks every later "
@@ -197,7 +211,7 @@ resource 'vers' (1, locked) {
 #endif
 
 resource 'vers' (2, locked) {
-    0x02, 0x00, 0x80, 0x00, verUS,
-    "2.0",
-    "AirPort Extreme 2.0"
+    0x02, 0x01, 0x80, 0x00, verUS,
+    "2.0.1",
+    "AirPort Extreme 2.0.1"
 };

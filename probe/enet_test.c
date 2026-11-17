@@ -33,11 +33,24 @@ static int MacEq(const UInt8 *a,const UInt8 *b)
 static int gCcmpWorks = 1;
 static UInt8 gCcmpPlain[256];
 static ApU32 gCcmpPlainLen = 0;
+/* 2.0.1: the stub also reports a packet number and key id, as the real one does, because the replay
+ * check sits on them. By default the PN advances on every successful call, so tests that are not
+ * about replays never trip it; gCcmpPnHold freezes it so a test can choose. gCcmpCalls and
+ * gCcmpLastCap let a test prove an oversized frame never reached the decrypt at all. */
+static UInt8 gCcmpPn[6] = {0,0,0,0,0,1};
+static int   gCcmpPnHold = 0, gCcmpKid = 0, gCcmpCalls = 0;
+static ApU32 gCcmpLastCap = 0;
 static int ApCcmpDecap(const ApU8 *f,ApU32 flen,const ApU8 *key,
-                       ApU8 *out,ApU32 *outLen,ApU8 *pn,int *kid)
-{ (void)f;(void)flen;(void)key;(void)pn;(void)kid;
-  if(!gCcmpWorks) return 0;
-  memcpy(out,gCcmpPlain,gCcmpPlainLen); if(outLen)*outLen=gCcmpPlainLen; return 1; }
+                       ApU8 *out,ApU32 outCap,ApU32 *outLen,ApU8 *pn,int *kid)
+{ int i;
+  (void)f;(void)flen;(void)key;
+  gCcmpCalls++; gCcmpLastCap = outCap;
+  if(!gCcmpWorks || gCcmpPlainLen > outCap) return 0;
+  memcpy(out,gCcmpPlain,gCcmpPlainLen); if(outLen)*outLen=gCcmpPlainLen;
+  if(pn) for(i=0;i<6;i++) pn[i] = gCcmpPn[i];
+  if(kid) *kid = gCcmpKid;
+  if(!gCcmpPnHold) for(i=5;i>=0;i--) if(++gCcmpPn[i]) break;
+  return 1; }
 
 /* Claim ap_ccmp.h's include guard so ap_enet.h picks up the stub above instead of the real
  * AES. The conversion under test is framing; the crypto has its own suite. */
@@ -919,6 +932,113 @@ int main(void)
           chk("⛔ lying IHL: refused, no overread",
               ApTxIcmpInspect(g, 36, &ic) == 0, &fails);
           FreeGuarded(g, 36); }
+    }
+
+    /* ══ 2.0.1: THE RECEIVE-PATH SECURITY FIXES ══════════════════════════════════════════════════ */
+    printf("\n2.0.1 receive-path fixes\n");
+    {
+        static UInt8 big[2200];
+        static const UInt8 SNAP_EAPOL[] = {0xAA,0xAA,0x03,0x00,0x00,0x00,0x88,0x8E,
+                                           0x01,0x03,0x00,0x5F,0x02,0x00,0x8A,0x00};
+        UInt8 qos[2 + 16];
+        int calls;
+        memset(big, 0x33, sizeof big);
+        memset(qos, 0, sizeof qos);
+        gCcmpWorks = 1; gCcmpPnHold = 0; gCcmpKid = 0;
+        memcpy(gCcmpPlain,SNAP_ARP,sizeof SNAP_ARP); gCcmpPlainLen = sizeof SNAP_ARP;
+
+        /* THE OVERRUN: a protected payload bigger than the 2048-byte plaintext buffer is refused
+         * BEFORE the decrypt runs (CCM writes before it checks the MIC); one at the limit gets there. */
+        calls = gCcmpCalls;
+        mkframe(0x4208,OURS,AP_,PEER,big,2048 + 16 + 1);
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 payload 2049 -> TOO_BIG",r,0,AP_ENET_TOO_BIG,why);
+        chk("2.0.1 ...and the decrypt was never called", gCcmpCalls == calls, &fails);
+        mkframe(0x4208,OURS,AP_,PEER,big,2048 + 16);
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 payload 2048 -> reaches the decrypt",r,1,0,why);
+        chk("2.0.1 ...and the decrypt is told the buffer's capacity",
+            gCcmpLastCap == AP_ENET_PLAINBUF, &fails);
+        mkframe(0x4208,OURS,AP_,PEER,big,15);
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 protected, shorter than hdr+MIC",r,0,AP_ENET_TOO_SHORT,why);
+
+        /* REPLAY: a PN that is not newer is dropped, and a failed MIC never moves the window. */
+        ApEnetReplayNewTk();
+        gCcmpPnHold = 1; memset(gCcmpPn,0,6); gCcmpPn[5] = 10;
+        mkframe(0x4208,OURS,AP_,PEER,SNAP_ARP,sizeof SNAP_ARP);
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 PN 10 accepted",r,1,0,why);
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 PN 10 again -> REPLAY",r,0,AP_ENET_REPLAY,why);
+        gCcmpPn[5] = 9;
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 PN 9, older -> REPLAY",r,0,AP_ENET_REPLAY,why);
+        gCcmpPn[5] = 11; gCcmpWorks = 0;
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 PN 11, bad MIC -> DECRYPT_FAILED",r,0,AP_ENET_DECRYPT_FAILED,why);
+        gCcmpWorks = 1;
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 ...PN 11 still accepted after it",r,1,0,why);
+        gCcmpPn[4] = 1; gCcmpPn[5] = 0;                       /* 0x000000000100: a carry */
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 PN 0x100, byte carry, accepted",r,1,0,why);
+
+        /* One window per QoS TID: a lower PN on another TID is not a replay. */
+        gCcmpPn[4] = 0; gCcmpPn[5] = 50; qos[0] = 5;
+        mkframe(0x4288,OURS,AP_,PEER,qos,sizeof qos);
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 QoS TID 5, PN 50 accepted",r,1,0,why);
+        gCcmpPn[5] = 20; qos[0] = 3;
+        mkframe(0x4288,OURS,AP_,PEER,qos,sizeof qos);
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 QoS TID 3, PN 20, own window",r,1,0,why);
+        gCcmpPn[5] = 40; qos[0] = 5;
+        mkframe(0x4288,OURS,AP_,PEER,qos,sizeof qos);
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 QoS TID 5, PN 40 -> REPLAY",r,0,AP_ENET_REPLAY,why);
+
+        /* Group frames use their key index's own window, separate from the pairwise one. */
+        gCcmpKid = 1; gCcmpPn[5] = 5;
+        mkframe(0x4208,BCAST,AP_,PEER,SNAP_ARP,sizeof SNAP_ARP);
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 group key 1, PN 5 accepted",r,1,0,why);
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 group key 1, PN 5 again -> REPLAY",r,0,AP_ENET_REPLAY,why);
+        gCcmpKid = 2;
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 group key 2, PN 5, own window",r,1,0,why);
+        ApEnetReplayNewGtk(1); gCcmpKid = 1; gCcmpPn[5] = 3;
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 new group key 1: first frame accepted",r,1,0,why);
+
+        /* A new PTK restarts the pairwise window at 0: PN 1 is accepted, PN 0 never. */
+        ApEnetReplayNewTk(); gCcmpKid = 0; gCcmpPn[5] = 0;
+        mkframe(0x4208,OURS,AP_,PEER,SNAP_ARP,sizeof SNAP_ARP);
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 new PTK: PN 0 -> REPLAY",r,0,AP_ENET_REPLAY,why);
+        gCcmpPn[5] = 1;
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 new PTK: PN 1 accepted",r,1,0,why);
+
+        /* UNENCRYPTED DATA on a secured network is dropped, EAPOL excepted; open networks unchanged. */
+        gApEnetRequireProt = 1;
+        mkframe(0x0208,OURS,AP_,PEER,SNAP_ARP,sizeof SNAP_ARP);
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 secured: plain ARP -> UNPROTECTED",r,0,AP_ENET_UNPROTECTED,why);
+        mkframe(0x0208,BCAST,AP_,PEER,SNAP_ARP,sizeof SNAP_ARP);
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 secured: plain bcast -> UNPROTECTED",r,0,AP_ENET_UNPROTECTED,why);
+        mkframe(0x0208,OURS,AP_,PEER,SNAP_EAPOL,sizeof SNAP_EAPOL);
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 secured: plain EAPOL delivered",r,1,0,why);
+        chk("2.0.1 ...as ethertype 0x888E", r && out[12] == 0x88 && out[13] == 0x8E, &fails);
+        gApEnetRequireProt = 0;
+        mkframe(0x0208,OURS,AP_,PEER,SNAP_ARP,sizeof SNAP_ARP);
+        r = ApRxToEnet(buf,FRAMEOFFSET,tk,1,gtk,1,OURS,out,&olen,&why);
+        check("2.0.1 open: plain ARP still delivered",r,1,0,why);
+
+        gCcmpPnHold = 0; gCcmpKid = 0;
     }
 
     printf("\n%s\n", fails ? "FAILURES" : "[ok] all conversion cases pass");

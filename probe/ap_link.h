@@ -213,11 +213,26 @@ static void ApLinkTurnOn(ApLink *L, ApLinkU32 now)
     L->downTick = now; L->nextTick = now;
 }
 
+/* ★ k247: IS A JOIN ATTEMPT DUE NOW? The down half of ApLinkStep on its own, so that the heartbeat (secondary
+ * interrupt level) asks exactly the question the task will answer -- ApLinkSilent's pattern. Read-only: the
+ * heartbeat may call it on a struct the task is writing, and a torn read costs one early or one late post. */
+static int ApLinkTryDue(const ApLink *L, ApLinkU32 now, ApLinkU32 lastBeacon, int beaconSeen)
+{
+    int audible;
+    if (L->off || L->up) return 0;
+    if ((int)(now - L->nextTick) < 0) return 0;
+    audible = beaconSeen && ApLinkAge(now, lastBeacon) < AP_LINK_AUDIBLE_TICKS;
+    if (!audible) {
+        ApLinkU32 since = ApLinkAge(now, L->tried ? L->lastTryTick : L->downTick);
+        if (since < ApLinkFallbackTicks(L->fails)) return 0;
+    }
+    return 1;
+}
+
 /* Returns AP_LINK_ACT_WENT_DOWN when this call declared the link lost (the caller stops transmitting),
  * AP_LINK_ACT_TRY when the caller should make ONE join attempt now and report it with ApLinkAttempted. */
 static int ApLinkStep(ApLink *L, const ApLinkFacts *f)
 {
-    int audible;
     if (L->off) {                    /* k207: consume kicks (the AP answering our deauth), decide nothing */
         L->kickSeen = f->kickSeq;
         return AP_LINK_ACT_NONE;
@@ -239,12 +254,7 @@ static int ApLinkStep(ApLink *L, const ApLinkFacts *f)
     /* Down. More deauths are expected now (the AP answers any frame of ours with one); they are
      * consumed without restarting the schedule, or a chatty AP could postpone the rejoin forever. */
     L->kickSeen = f->kickSeq;
-    if ((int)(f->now - L->nextTick) < 0) return AP_LINK_ACT_NONE;
-    audible = f->beaconSeen && ApLinkAge(f->now, f->lastBeacon) < AP_LINK_AUDIBLE_TICKS;
-    if (!audible) {
-        ApLinkU32 since = ApLinkAge(f->now, L->tried ? L->lastTryTick : L->downTick);
-        if (since < ApLinkFallbackTicks(L->fails)) return AP_LINK_ACT_NONE;
-    }
+    if (!ApLinkTryDue(L, f->now, f->lastBeacon, f->beaconSeen)) return AP_LINK_ACT_NONE;
     L->tried = 1; L->lastTryTick = f->now; L->tries++;
     return AP_LINK_ACT_TRY;
 }
@@ -254,6 +264,96 @@ static void ApLinkAttempted(ApLink *L, ApLinkU32 now, int ok)
     if (ok) { L->up = 1; L->fails = 0; L->rejoins++; return; }
     L->fails++;
     L->nextTick = now + ApLinkRetryTicks(L->fails);
+}
+
+/* --- when the heartbeat asks for task time (k247) ------------------------------------------------
+ *
+ * ★★ WHY THERE IS NO KEEPALIVE ANY MORE. Every Notification Manager request is ACTIVITY to Mac OS: the ROM's
+ * NMInstall calls _IdleUpdate, which pushes the system's idle clock 10 s ahead, at most once per 10 s
+ * (firewire-fw800/usb-wake/NPM-IDLE-TIMER.md in claude-os9). Through build 246 the heartbeat posted a keepalive
+ * every 5 s while the link was up or AirPort was off, and every 1 s while down, so with TCP/IP on AirPort the
+ * Mac never took an idle sleep: on the FW800, 2026-11-16, 217 of the 219 non-input pushes in 36 minutes were this
+ * request, one every 10 s, the most Mac OS allows (claude-os9 firewire-fw800/logs/airport-idle-baseline-hw-
+ * 2026-11-16). Apple's own AirPort Driver reports no activity at all: no NMInstall, only STREAMS timers and OT
+ * deferred tasks.
+ *
+ * So the heartbeat posts only when the task body has something to do, and names it:
+ *   EVENT    the receive pump recorded a kick, an EAPOL frame or a group-key result, to act on or print;
+ *   COMMAND  the panel or the strip left a command in the status block;
+ *   SILENT   up, the pump running, and 3 s without a beacon from our AP: the body must declare the loss;
+ *   SCAN     the one-shot boot scan: once to stamp its start, once AP_LINK_SCAN_WAIT_TICKS later to run it;
+ *   LOG      log lines the body has not yet dealt with, at most one write per AP_LINK_FLUSH_TICKS, and only
+ *            when the body may write them (`logWritable`: ApLinkMaybeFlush's own rule -- up, or a first load
+ *            whose link has never been up, k245; never while an AppleShare volume could be hanging on a lost
+ *            link);
+ *   TRY      down, a network to try and its key not refused, and ApLinkTryDue says the schedule allows it --
+ *            never within AP_LINK_TRY_POST_TICKS of the previous TRY post (the old down keepalive, kept as a
+ *            ceiling). Only TRY posts count: the schedule never asks sooner (its shortest retry is 1 s), so the
+ *            ceiling bites only if a TRY body failed to consume its reason, and a kick's EVENT post just before
+ *            must not delay the first attempt (0.5 s after a deauth, as before).
+ * Up and quiet, or off, it posts NOTHING, and the body's 30-s status line and its disk write go with it: that
+ * write was a second source of activity (a disk report every 30 s), masked in the measurement above.
+ *
+ * ⚠ EVERY REASON MUST BE CONSUMED BY THE BODY IT CAUSES, or the heartbeat posts again on its next tick and the
+ *   pump is back, faster than before. EVENT: the body drains the ring. COMMAND: it acknowledges. SILENT: it
+ *   declares the loss (up goes to 0). SCAN: it stamps scanTick, then sets scanDone. LOG: the flush records the
+ *   ring count it dealt with -- written, failed or held -- so `newLines` goes false. TRY: the attempt moves
+ *   nextTick or brings the link up. link_test.c's pump model runs a body that does exactly that, checks that
+ *   it makes the same join attempts at the same ticks as a body run on every tick, and counts the posts. */
+#define AP_LINK_SCAN_WAIT_TICKS   20u    /* the boot scan runs 5 s after the link first comes up */
+#define AP_LINK_FLUSH_TICKS       40u    /* new lines reach the disk within 10 s (at once after an event) */
+#define AP_LINK_TRY_POST_TICKS     4u    /* a TRY post at most once a second */
+
+enum { AP_LINK_WANT_NONE = 0, AP_LINK_WANT_EVENT = 1, AP_LINK_WANT_COMMAND = 2, AP_LINK_WANT_SILENT = 3,
+       AP_LINK_WANT_SCAN = 4, AP_LINK_WANT_LOG = 5, AP_LINK_WANT_TRY = 6, AP_LINK_WANT_N = 7 };
+
+typedef struct {
+    ApLinkU32      now;             /* link ticks */
+    int            events;          /* the event ring is not empty */
+    int            command;         /* a UI command is waiting in the status block */
+    int            up;              /* the heartbeat's copy of the link state (gLinkUpFlag) */
+    int            monitoring;      /* the receive pump is running */
+    int            radioOn;         /* AirPort is on */
+    ApLinkU32      lastBeacon;      /* tick of the latest beacon from our BSSID (valid iff beaconSeen) */
+    int            beaconSeen;
+    int            canTry;          /* a network is chosen and its key has not been refused */
+    int            scanDone;        /* the boot scan has run (or been abandoned) */
+    ApLinkU32      scanTick;        /* when the body first saw the link up for the scan; 0 = not yet */
+    int            newLines;        /* log lines the body has not yet dealt with */
+    int            logWritable;     /* the body's flush would write, not hold (ApLinkMaybeFlush's rule) */
+    ApLinkU32      lastFlush;       /* tick of the latest log write */
+    ApLinkU32      lastTryPost;     /* tick of the latest TRY post */
+} ApLinkWantFacts;
+
+static int ApLinkWant(const ApLink *L, const ApLinkWantFacts *w)
+{
+    if (w->events)  return AP_LINK_WANT_EVENT;
+    if (w->command) return AP_LINK_WANT_COMMAND;
+    if (w->up) {
+        if (w->monitoring && ApLinkSilent(w->now, w->lastBeacon, w->beaconSeen)) return AP_LINK_WANT_SILENT;
+        if (!w->scanDone && w->radioOn
+            && (w->scanTick == 0u || ApLinkAge(w->now, w->scanTick) >= AP_LINK_SCAN_WAIT_TICKS))
+            return AP_LINK_WANT_SCAN;
+    } else if (w->radioOn && w->canTry && ApLinkAge(w->now, w->lastTryPost) >= AP_LINK_TRY_POST_TICKS
+               && ApLinkTryDue(L, w->now, w->lastBeacon, w->beaconSeen)) {
+        return AP_LINK_WANT_TRY;                  /* its body writes the log too */
+    }
+    if (w->newLines && w->logWritable && ApLinkAge(w->now, w->lastFlush) >= AP_LINK_FLUSH_TICKS)
+        return AP_LINK_WANT_LOG;
+    return AP_LINK_WANT_NONE;
+}
+
+static const char *ApLinkWantName(int why)
+{
+    switch (why) {
+    case AP_LINK_WANT_EVENT:   return "event";
+    case AP_LINK_WANT_COMMAND: return "command";
+    case AP_LINK_WANT_SILENT:  return "silence";
+    case AP_LINK_WANT_SCAN:    return "boot scan";
+    case AP_LINK_WANT_LOG:     return "log";
+    case AP_LINK_WANT_TRY:     return "rejoin";
+    default:                   return "(none)";
+    }
 }
 
 /* --- words for the log --------------------------------------------------------------------------- */

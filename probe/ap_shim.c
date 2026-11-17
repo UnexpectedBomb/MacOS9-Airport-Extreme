@@ -3356,6 +3356,14 @@ UInt32 AirPortShimHandshake(void)
 
         Say(micOk ? "      [ok] message 3's OWN MIC verifies against our KCK"
                   : "      [!!] message 3's own MIC does NOT verify -- NOT unwrapping it.");
+        /* ⛔ 2.0.1: A MESSAGE 3 THAT FAILS ITS MIC ENDS THE ATTEMPT. Through 2.0 the driver refused to
+         * unwrap it but still sent message 4, set gShimHsErr = noErr and reported the handshake complete:
+         * the link came up after an unauthenticated message 3, with no GTK and the transmit PN never
+         * reset. gShimM3 is already 1, so the wrong-password latch (ap_shim.c, "m2 sent, no m3") does
+         * not count this attempt against the key: a message 3 at all means the AP accepted message 2. */
+        if(!micOk){
+          Say("      [!!] no message 4 for a message 3 that failed its MIC; this attempt fails.");
+          gShimHsErr = paramErr; goto done; }
 
         if(micOk && (gShimM3Info & KEYINFO_ENCRYPTED) && m3DataLen >= 24
            && m3DataLen <= sizeof(gShimKdBuf) + 8){
@@ -3386,6 +3394,7 @@ UInt32 AirPortShimHandshake(void)
                   /* k208: and into the table, under the index the AP named -- the receive path now picks
                    * a group frame's key by the index in its own CCMP header. */
                   ApGtkInstall(&gGtkTab,(int)gShimGtkId,(const ApU8*)gGtk,(ApU32)glen);
+                  ApEnetReplayNewGtk((int)gShimGtkId);     /* 2.0.1: a new key, a fresh replay window */
                   gGkLastKid = (UInt32)gShimGtkId; } }
               q = (UInt16)(q + 2 + ln); }
             /* ⛔⛔ 8-8: THE TRANSMIT PN, RESET HERE BECAUSE THE PTK IS FRESH.
@@ -3416,13 +3425,18 @@ UInt32 AirPortShimHandshake(void)
           } else {
             Say("      [!!] the RFC 3394 integrity check FAILED -- the KEK is wrong or the data");
             Say("        was altered. ApAesUnwrap leaves the output alone rather than handing");
-            Say("        back a partial result, so there is nothing to salvage."); } }
+            Say("        back a partial result, so there is nothing to salvage.");
+            /* ⛔ 2.0.1: and, like a failed MIC, it ends the attempt: no message 4 (see above). */
+            Say("      [!!] no message 4 for a message 3 whose key data failed; this attempt fails.");
+            gShimHsErr = paramErr; goto done; } }
     }
 
     /* ── message 4 ── */
     { UInt16 m4info = (UInt16)((gShimM3Info & KEYINFO_SECURE)|(gShimM3Info & KEYINFO_VERSION)
                                |KEYINFO_PAIRWISE|KEYINFO_MIC);
       UInt16 m4len;
+      /* ⛔ 2.0.1: the PTK goes into use with this message, so its receive PNs start again at 0. */
+      ApEnetReplayNewTk();
       /* ⚠ the replay counter comes from MESSAGE 3, not message 1. Echoing message 1's is
        * rejected. */
       for(z=0;z<8;z++) gReplay[z] = eap[EAPOL_O_REPLAY+z];
@@ -4090,6 +4104,9 @@ static UInt32 ApShimPumpLocked(UInt32 maxFrames)
                 gkId    = ApGtkFrameKeyId(fh, raw - K6_HDR_PLCP6 - 4UL);
                 gkGroup = ApEnetIsGroup(fh + 4); } }            /* addr1, the receiver, is a group address */
         gk = ApGtkFor(&gGtkTab, gkId);
+        /* ⛔ 2.0.1: on a secured network ApRxToEnet drops unencrypted data (EAPOL excepted). Set from the
+         * target every frame, so it can never lag a switch between an open and a secured network. */
+        gApEnetRequireProt = (gTargetSec != kApSecOpen);
         tbConv = ApTbNow();
         if(!ApRxToEnet(gPromptBuf,B43_DMA0_RX_FW351_FO,
                        gPtk + AP_TK_OFF, gPtkReady,
@@ -4338,8 +4355,12 @@ static volatile UInt32 gIrqIdleRuns = 0, gIrqBraked = 0;
  *
  * WHO POSTS: this one-shot SetInterruptTimer, re-armed from its own handler -- EHCI's vhub_heartbeat, the
  * same primitive k144 proved here. It also IS the link clock (gLinkTick): stamps and checks both read it
- * (EHCI h83). It posts when there is work: an event to print or act on, a silence that looks like a lost
- * link, or the keepalive (every 5 s up, every 1 s down) that lets the task body run the schedule.
+ * (EHCI h83). It posts ONLY when there is work, and counts each post by its reason (ApLinkWant, ap_link.h):
+ * an event to print or act on, a UI command, a silence that looks like a lost link, the boot scan, new log
+ * lines, or a rejoin the schedule says is due.
+ * ★ k247: NO KEEPALIVE. Through build 246 it also posted every 5 s while up or off (every 1 s while down) so
+ *   the body could write a status line and flush the log. Each post is activity to Mac OS, so that kept the
+ *   Mac from ever taking an idle sleep with TCP/IP on AirPort (measured 2026-11-16; ap_link.h has the story).
  * ⚠ The receive pump alone could not be the poster: a radio that has gone completely quiet raises no
  *   interrupt, so the one outage that most needs noticing would also stop the noticing.
  *
@@ -4348,8 +4369,6 @@ static volatile UInt32 gIrqIdleRuns = 0, gIrqBraked = 0;
  *   before task level resumes, so none can run after TerminateStreamModule returns.
  * ⚠ SECONDARY INTERRUPT LEVEL: counters, word reads, NMInstall, SetInterruptTimer. check-exec-level.py
  *   audits ApLinkTimer as an interrupt root. */
-#define AP_LINK_KEEPALIVE_UP_TICKS    20u     /* 5 s: the body's heartbeat and log flush run on this */
-#define AP_LINK_KEEPALIVE_DOWN_TICKS   4u     /* 1 s: while down, the rejoin schedule is checked often */
 static TimerID         gLinkTimerId      = 0;
 static volatile int    gLinkRunning      = 0, gLinkStop = 0, gLinkTimerArmed = 0;
 static volatile UInt32 gLinkTimerRuns    = 0, gLinkTimerFails = 0, gLinkTimerRevived = 0;
@@ -4359,8 +4378,12 @@ static volatile int    gLinkNmPosted     = 0;
 static volatile UInt32 gLinkNmArmed      = 0, gLinkNmFired = 0, gLinkNmFailed = 0;
 static volatile UInt32 gLinkLastPostTick = 0;
 static volatile unsigned long gLinkNmArmTb = 0;     /* timebase at the post, for the latency */
+static volatile UInt32 gLinkWantN[AP_LINK_WANT_N];  /* k247: posts made, by reason (AP_LINK_WANT_*) */
+static volatile int    gLinkLastWhy      = 0;       /* k247: the reason of the latest post */
+static volatile UInt32 gLinkLastTryPostTick = 0;    /* k247: the latest TRY post (its once-a-second ceiling) */
 
 static OSStatus ApLinkTimer(void *p1, void *p2);
+static int ApLinkWantReason(void);                  /* k247: below, where the state it reads is declared */
 
 static void ApLinkArmTimer(void)
 {
@@ -4369,7 +4392,8 @@ static void ApLinkArmTimer(void)
     else gLinkTimerFails++;
 }
 
-static void ApLinkPost(void)
+/* Posts the request. `why` is the reason ApLinkWant gave (k247), counted only when the post is made. */
+static void ApLinkPost(int why)
 {
     if(gLinkNmPosted || !gLinkNmUpp || gLinkStop) return;   /* one request in flight, never two */
     gLinkNm.qType   = nmType;
@@ -4381,24 +4405,19 @@ static void ApLinkPost(void)
     gLinkNm.nmRefCon = 0;
     gLinkLastPostTick = gLinkTick;
     gLinkNmArmTb = ApTbNow();
-    if(NMInstall(&gLinkNm) == noErr){ gLinkNmPosted = 1; gLinkNmArmed++; }
+    if(NMInstall(&gLinkNm) == noErr){
+        gLinkNmPosted = 1; gLinkNmArmed++;
+        if(why > 0 && why < AP_LINK_WANT_N) gLinkWantN[why]++;
+        if(why == AP_LINK_WANT_TRY) gLinkLastTryPostTick = gLinkTick;
+        gLinkLastWhy = why;
+    }
     else gLinkNmFailed++;
-}
-
-/* Is there task-level work? A HINT: the task body re-decides everything with ApLinkStep. */
-static int ApLinkWanted(void)
-{
-    if(gLinkEvtW != gLinkEvtR) return 1;                         /* a kick or a rekey to act on / print */
-    if(gApStat && gApStat->cmdSeq != gApStat->ackSeq) return 1;  /* k207: a command from the UI */
-    if(gLinkUpFlag && gIrqArmed && ApLinkSilent(gLinkTick, gLinkLastBcnTick, gLinkBcnSeen)) return 1;
-    return (UInt32)(gLinkTick - gLinkLastPostTick) >=
-           ((gLinkUpFlag || !gRadioPowerOn) ? AP_LINK_KEEPALIVE_UP_TICKS   /* off: nothing to retry */
-                                            : AP_LINK_KEEPALIVE_DOWN_TICKS);
 }
 
 static OSStatus ApLinkTimer(void *p1, void *p2)
 {
 #pragma unused (p1, p2)
+    int why;
     gLinkTimerArmed = 0;
     if(gLinkStop) return noErr;          /* EHCI lc1: FIRST, and no re-arm -- this is what makes it stop */
     gLinkTick++;
@@ -4408,7 +4427,9 @@ static OSStatus ApLinkTimer(void *p1, void *p2)
         gApStat->heartbeat  = gLinkTick;
         gApStat->txRateKbps = (r < AP_TX_NRATES) ? (UInt32)kTxRates[r].mbps * 1000UL : 0;
     }
-    if(ApLinkWanted()) ApLinkPost();
+    /* k247: a post only for work (ApLinkWant). Its answer is a HINT: the task body re-decides everything. */
+    why = (gLinkNmPosted || !gLinkNmUpp) ? AP_LINK_WANT_NONE : ApLinkWantReason();
+    if(why != AP_LINK_WANT_NONE) ApLinkPost(why);
     ApLinkArmTimer();
     return noErr;
 }
@@ -5210,7 +5231,8 @@ static void ApGkRenew(const UInt8 *eth, UInt32 len)
         for(i = 0; i < 8u; i++) gGkReplay[i] = m.replay[i];    /* accepted: nothing older is answered again */
         same = ApGtkSame(&gGtkTab, m.keyId, m.gtk, m.gtkLen);
         if(same) gGkSame++;                                    /* the AP resent it: answered, not reinstalled */
-        else     ApGtkInstall(&gGtkTab, m.keyId, m.gtk, m.gtkLen);
+        else   { ApGtkInstall(&gGtkTab, m.keyId, m.gtk, m.gtkLen);
+                 ApEnetReplayNewGtk(m.keyId); }               /* 2.0.1: a new key, a fresh replay window */
         for(i = 0; i < 32u; i++) m.gtk[i] = 0;                 /* the clear copy does not outlive the call */
         if((UInt32)m.keyId != gGkLastKid && gGkLastKid < 4u) gGkKidChanges++;
         gGkLastKid = (UInt32)m.keyId; gGkLastTick = gLinkTick;
@@ -5908,9 +5930,14 @@ static UInt32 gLinkLastHbTick = 0, gLinkLastFlushTick = 0;
 static UInt32 gLinkHbBcn = 0, gLinkHbRx = 0, gLinkHbTx = 0;
 static UInt32 gLinkEvtLost = 0, gLinkFlushHeld = 0;
 static int    gLinkEverUp = 0;   /* k245: the link has been up at least once in this load (ApLinkMaybeFlush) */
-#define AP_LINK_HB_UP_TICKS    120u   /* a status line every 30 s while up ... */
-#define AP_LINK_HB_DOWN_TICKS   40u   /* ... every 10 s while down */
-#define AP_LINK_FLUSH_TICKS     40u   /* new lines reach the disk within 10 s, at once after an event */
+static unsigned long gLinkFlushSeenN = 0;   /* k247: the ring count ApLinkMaybeFlush last dealt with (written,
+                                             * failed or held), so new lines and only new lines ask for a post */
+static UInt32 gLinkFlushTries = 0;          /* k247: flushes the body attempted (written or failed) */
+/* k247: these two now pace a line that is written only when a body runs for some other reason (ApLinkWant):
+ * there is no keepalive to run one every 30 s, and a status line written to disk every 30 s was itself
+ * activity to Mac OS. AP_LINK_FLUSH_TICKS (10 s) is in ap_link.h, which the heartbeat's decision shares. */
+#define AP_LINK_HB_UP_TICKS    120u   /* at most one status line per 30 s while up ... */
+#define AP_LINK_HB_DOWN_TICKS   40u   /* ... per 10 s while down */
 
 /* ★★ k205: THE STATUS BLOCK's task-level half (ap_status.h). Published once, from ApLinkStart; the
  * identity -- state, network name, base station ID, channel -- rewritten only here, under seq. */
@@ -6686,10 +6713,17 @@ static void ApLinkMaybeFlush(int event)
     if(!gLinkTxBlocked) gLinkEverUp = 1;
     if(!ApShimLogHasNew()) return;
     if(gLinkTxBlocked && (gLinkEverUp || !gApLife || gApLife->loads > 1)){
-        gLinkFlushHeld++; return; }                        /* see the block above: never behind AppleShare */
+        gLinkFlushHeld++;
+        gLinkFlushSeenN = ApRingCount();                   /* k247: dealt with -- no post until NEW lines */
+        return; }                                          /* see the block above: never behind AppleShare */
     if(!event && ApLinkAge(gLinkTick, gLinkLastFlushTick) < AP_LINK_FLUSH_TICKS) return;
     ApShimDumpRingToFile();
     gLinkLastFlushTick = gLinkTick;
+    gLinkFlushTries++;
+    /* k247: AFTER the write, which may have emptied the ring (recycled to 0). Also when the write failed (no
+     * file, a full disk): lines it could not write wait for new ones, rather than asking for a post on every
+     * heartbeat -- a pump is exactly what this build removes. */
+    gLinkFlushSeenN = ApRingCount();
 }
 
 /* k209: one automatic scan a few seconds after the link first comes up, so the network list is ready the
@@ -6735,16 +6769,19 @@ static void ApLinkTaskBody(void)
     }
     /* k209: the one-shot boot scan. Only while genuinely up and not already scanning; ~5 s after the link
      * came up, so the join and its first traffic are done. gRadioPowerOn guards it against running with the
-     * radio switched off. */
-    if(!gScanBootDone && gLink.up && gRadioPowerOn){
-        if(gScanBootTick == 0) gScanBootTick = gLinkTick;
-        else if((UInt32)(gLinkTick - gScanBootTick) >= 20u){    /* 20 ticks = 5 s */
+     * radio switched off.
+     * ⚠ k247: gLinkUpFlag, NOT gLink.up -- the heartbeat posts AP_LINK_WANT_SCAN from exactly this condition, so
+     *   this body must test the same variable or a disagreement would leave the reason unconsumed and the
+     *   heartbeat posting on every tick. (They are equal whenever a body runs: every writer sets both.) */
+    if(!gScanBootDone && gLinkUpFlag && gRadioPowerOn){
+        if(gScanBootTick == 0) gScanBootTick = gLinkTick ? gLinkTick : 1u;   /* k247: 0 means "not stamped" */
+        else if(ApLinkAge(gLinkTick, gScanBootTick) >= AP_LINK_SCAN_WAIT_TICKS){   /* 5 s */
             gScanBootDone = 1;
             (void)ApScanRunCommand();
             event = 1;
         }
     }
-    if(!gLink.up) gScanBootTick = 0;         /* an outage before the first scan: time it from the next up */
+    if(!gLinkUpFlag) gScanBootTick = 0;      /* an outage before the first scan: time it from the next up */
     ApLinkHeartbeat(gLinkTick);
     ApLinkMaybeFlush(event);
 }
@@ -6801,6 +6838,7 @@ static void ApLinkStart(int joined)
     if(joined){ gLinkLastBcnTick = gLinkTick; gLinkBcnSeen = 1; gLinkEverUp = 1; }   /* k245: see ApLinkMaybeFlush */
     gLinkTxBlocked = !joined;
     gLinkLastHbTick = gLinkTick; gLinkLastFlushTick = gLinkTick; gLinkLastPostTick = gLinkTick;
+    gLinkLastTryPostTick = gLinkTick - AP_LINK_TRY_POST_TICKS;   /* k247: the ceiling never delays a first try */
     ApLinkArmTimer();
     gLinkRunning = 1;
     Say("");
@@ -6808,6 +6846,7 @@ static void ApLinkStart(int joined)
     Say1("    heartbeat every ms            = ", (unsigned long)AP_LINK_TICK_MS);
     Say1("    heartbeat armed (1 = ok)      = ", (unsigned long)gLinkTimerArmed);
     SayH("    task pump UPP (system zone)   = ", (unsigned long)gLinkNmUpp, 8);
+    Say ("    task pump: posts only for work (k247: no keepalive; up and quiet = no posts, no status lines)");
     Say(joined ? "    link UP at start"
                : "    link DOWN at start (the boot join did not complete): rejoin when the AP is heard");
 }
@@ -7024,6 +7063,34 @@ static unsigned long gLogFlushedN = 0;    /* ring lines already on disk */
 static UInt32        gLogRecycles = 0;
 
 static int ApShimLogHasNew(void) { return !gLogBegun || ApRingCount() > gLogFlushedN; }
+
+/* ★ k247: THE HEARTBEAT'S QUESTION -- is there task-level work, and what is it? (ApLinkWant, ap_link.h, holds
+ * the rule and its host tests; this only gathers the facts.) Here, below every piece of state it reads.
+ * ⚠ SECONDARY INTERRUPT LEVEL (ApLinkTimer): single-word reads and pure arithmetic only. gLink is the task's
+ *   struct; a torn read of it costs one early or one late post, never a wrong decision -- the body re-decides. */
+static int ApLinkWantReason(void)
+{
+    ApLinkWantFacts w;
+    unsigned long n = ApRingCount();
+    w.now        = gLinkTick;
+    w.events     = (gLinkEvtW != gLinkEvtR);
+    w.command    = (gApStat != NULL && gApStat->cmdSeq != gApStat->ackSeq);
+    w.up         = gLinkUpFlag;
+    w.monitoring = gIrqArmed;
+    w.radioOn    = gRadioPowerOn;
+    w.lastBeacon = gLinkLastBcnTick;
+    w.beaconSeen = gLinkBcnSeen;
+    w.canTry     = (gHaveTarget && !gShimKeyBad);
+    w.scanDone   = gScanBootDone;
+    w.scanTick   = gScanBootTick;
+    w.newLines   = (!gLogBegun || n > gLogFlushedN) && n != gLinkFlushSeenN;
+    /* ApLinkMaybeFlush's hold rule, inverted: it writes unless the link is blocked AND a share could be hanging
+     * on it (the link was up this load, or this is a reload, or there is no lifecycle block to ask). */
+    w.logWritable = !gLinkTxBlocked || !(gLinkEverUp || !gApLife || gApLife->loads > 1);
+    w.lastFlush  = gLinkLastFlushTick;
+    w.lastTryPost = gLinkLastTryPostTick;
+    return ApLinkWant(&gLink, &w);
+}
 
 static void ApShimDumpRingToFile(void)
 {
@@ -8786,6 +8853,20 @@ void ApOtmSnapshot(void)
         Say1("                                              ", (unsigned long)gLinkNested);
         Say1("        post -> run, max ms                   ", (unsigned long)(gLinkLatMaxUs / 1000u));
         Say1("        body, max ms                          ", (unsigned long)(gLinkBodyMaxUs / 1000u));
+        {   /* ★ k247: WHY each post was made. There is no keepalive now: up and quiet should add NOTHING here,
+             * and every post is activity to Mac OS (one pushes its idle clock 10 s). A climbing count with the
+             * link up and quiet names the reason that is being left unconsumed. */
+            int wi;
+            Say ("        posts by reason (k247; no keepalive):");
+            for(wi = 1; wi < AP_LINK_WANT_N; wi++){
+                Str255 L;
+                L[0] = 0; PCat(L, "          "); PCat(L, ApLinkWantName(wi)); PCat(L, " ");
+                PCatDec(L, (unsigned long)gLinkWantN[wi]);
+                Out(L);
+            }
+            Say1("        latest post's reason (1..6)           ", (unsigned long)gLinkLastWhy);
+            Say1("      log: flushes written or failed by the body", (unsigned long)gLinkFlushTries);
+        }
         Say1("      rejoin attempt, max / latest ms         ", (unsigned long)(gLinkRejoinMaxUs / 1000u));
         Say1("                                              ", (unsigned long)(gLinkRejoinLastUs / 1000u));
         Say1("      frames held while down (try later)      ", (unsigned long)gTxLinkDown);

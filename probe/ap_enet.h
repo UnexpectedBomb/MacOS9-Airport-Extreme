@@ -60,6 +60,8 @@ enum {
     AP_ENET_TOO_BIG,          /* would not fit an Ethernet frame */
     AP_ENET_NOT_FOR_US,       /* unicast to some other station */
     AP_ENET_OUR_OWN_TX,       /* ★ k120: the AP relayed our own broadcast back to us */
+    AP_ENET_REPLAY,           /* 2.0.1: packet number not newer than the last accepted for its key */
+    AP_ENET_UNPROTECTED,      /* 2.0.1: unencrypted data on a secured network (only EAPOL may be) */
     AP_ENET_NREASON
 };
 
@@ -78,6 +80,8 @@ static const char *ApEnetWhy(int w)
       case AP_ENET_TOO_BIG:        return "⚠ larger than an Ethernet frame";
       case AP_ENET_NOT_FOR_US:     return "unicast to another station";
       case AP_ENET_OUR_OWN_TX:     return "★ OUR OWN transmission, relayed back by the AP";
+      case AP_ENET_REPLAY:         return "duplicate or replay (packet number not newer)";
+      case AP_ENET_UNPROTECTED:    return "⚠ UNENCRYPTED data on a secured network, dropped";
       default:                     return "?"; }
 }
 
@@ -87,6 +91,55 @@ static const char *ApEnetWhy(int w)
 static int ApEnetIsGroup(const UInt8 *a){ return (a[0] & 0x01) != 0; }
 
 static UInt8 gApEnetPlain[AP_ENET_PLAINBUF];
+
+/* ⛔ 2.0.1: RECEIVE REPLAY PROTECTION. Through 2.0 ApCcmpDecap handed back every frame's packet number
+ * (PN) and nothing compared it, so a replayed encrypted frame, or an ordinary retransmission whose ACK
+ * was lost, was delivered again. Each key now keeps the last accepted PN per receive queue: the 16 QoS
+ * TIDs plus one for non-QoS data, as mac80211 does, because the AP numbers its frames from one counter
+ * per key while frames on different TIDs can arrive out of order. A frame whose PN is not newer is
+ * dropped as AP_ENET_REPLAY, and the counter moves only after the MIC verified.
+ *   - The pairwise TK starts at 0 on every new PTK (the AP's first PN is 1): ApEnetReplayNewTk.
+ *   - A group key starts UNSET and takes the first verified frame's PN (ApEnetReplayNewGtk). The driver
+ *     does not read the EAPOL Key RSC yet, so at most one stale group frame per key install can get
+ *     through; seeding from the RSC belongs with the PMF work, whose IGTK needs the same mechanism.
+ * PNs are 6 bytes, most significant first, exactly as ApCcmpHdrToPn lays them out. */
+#define AP_ENET_RP_NQ 17                      /* 16 QoS TIDs + 1 for non-QoS data */
+typedef struct { UInt8 pn[AP_ENET_RP_NQ][6]; UInt8 seen[AP_ENET_RP_NQ]; } ApEnetReplay;
+static ApEnetReplay gApEnetRpTk;              /* the pairwise TK */
+static ApEnetReplay gApEnetRpGtk[4];          /* one per group key index */
+
+/* ⛔ 2.0.1: ON A SECURED NETWORK, UNENCRYPTED DATA IS NOT DELIVERED. Through 2.0 a data frame without
+ * the Protected bit went up to Open Transport whatever the network's security, so anyone in range
+ * could inject traffic (ARP, DNS replies) on a WPA2 network without the password; the transmit side
+ * already refused to SEND unencrypted (ap_shim.c, k217). The caller sets this from the target's
+ * security kind before every call. EAPOL (ethertype 0x888E) is the one exception, as in mac80211:
+ * the EAPOL-Key MIC and replay counter authenticate those frames themselves. */
+static int gApEnetRequireProt = 0;
+
+static void ApEnetReplayClear(ApEnetReplay *r, int seen)
+{
+    int q, i;
+    for(q = 0; q < AP_ENET_RP_NQ; q++){
+        for(i = 0; i < 6; i++) r->pn[q][i] = 0;
+        r->seen[q] = (UInt8)seen; }
+}
+static void ApEnetReplayNewTk(void){ ApEnetReplayClear(&gApEnetRpTk, 1); }
+static void ApEnetReplayNewGtk(int kid){ if(kid >= 0 && kid < 4) ApEnetReplayClear(&gApEnetRpGtk[kid], 0); }
+
+/* 1 if PN a is newer (strictly greater) than PN b. */
+static int ApEnetPnNewer(const UInt8 *a, const UInt8 *b)
+{
+    int i;
+    for(i = 0; i < 6; i++) if(a[i] != b[i]) return a[i] > b[i];
+    return 0;
+}
+
+/* An 802.11 data body that is SNAP-wrapped EAPOL: AA AA 03 00 00 00 88 8E. */
+static int ApEnetIsEapolBody(const UInt8 *body, UInt32 len)
+{
+    return len >= 8UL && body[0] == 0xAA && body[1] == 0xAA && body[2] == 0x03 && body[3] == 0x00 &&
+           body[4] == 0x00 && body[5] == 0x00 && body[6] == 0x88 && body[7] == 0x8E;
+}
 
 /* ★ THE CONVERSION.
  *
@@ -175,19 +228,37 @@ static int ApRxToEnet(const UInt8 *rxbuf, UInt32 frameoffset,
         ApU8 pn[6]; int kid = 0, okDec;
         int group = ApEnetIsGroup(da);
         if(group ? !gtkReady : !tkReady){ if(whyOut) *whyOut = AP_ENET_NO_KEY; return 0; }
+        /* ⛔ 2.0.1: the payload must fit gApEnetPlain BEFORE anything is decrypted: CCM writes every
+         * byte before it checks the MIC (see ApCcmpDecap). 16 = the CCMP header (8) + the MIC (8). */
+        if(flen < hdrLen + 16UL){ if(whyOut) *whyOut = AP_ENET_TOO_SHORT; return 0; }
+        if(flen - hdrLen - 16UL > AP_ENET_PLAINBUF){ if(whyOut) *whyOut = AP_ENET_TOO_BIG; return 0; }
         key = group ? gtk : tk;
         AP_ENET_DECRYPT_BEGIN();
-        okDec = ApCcmpDecap((const ApU8*)f,(ApU32)flen,(const ApU8*)key,gApEnetPlain,&plen,pn,&kid);
+        okDec = ApCcmpDecap((const ApU8*)f,(ApU32)flen,(const ApU8*)key,
+                            gApEnetPlain,(ApU32)AP_ENET_PLAINBUF,&plen,pn,&kid);
         AP_ENET_DECRYPT_END(okDec);
         if(!okDec){
             if(whyOut) *whyOut = group ? AP_ENET_DECRYPT_FAILED_GROUP
                                        : AP_ENET_DECRYPT_FAILED;
             return 0; }
+        {   /* ⛔ 2.0.1: the replay check, only now that the MIC has verified (see ApEnetReplay). */
+            ApEnetReplay *rp = group ? &gApEnetRpGtk[kid & 3] : &gApEnetRpTk;
+            int q = isQos ? (int)(f[hdrLen - 2] & 0x0F) : (AP_ENET_RP_NQ - 1);
+            int i;
+            if(rp->seen[q] && !ApEnetPnNewer(pn, rp->pn[q])){
+                if(whyOut) *whyOut = AP_ENET_REPLAY;
+                return 0; }
+            for(i = 0; i < 6; i++) rp->pn[q][i] = pn[i];
+            rp->seen[q] = 1; }
         body    = gApEnetPlain;
         bodyLen = (UInt32)plen;
     } else {
         body    = f + hdrLen;
         bodyLen = flen - hdrLen;
+        /* ⛔ 2.0.1: no unencrypted data on a secured network, except EAPOL (see gApEnetRequireProt). */
+        if(gApEnetRequireProt && !ApEnetIsEapolBody(body, bodyLen)){
+            if(whyOut) *whyOut = AP_ENET_UNPROTECTED;
+            return 0; }
     }
 
     /* LLC/SNAP: AA AA 03 00 00 00 then the 2-byte ethertype. Anything else is not something an

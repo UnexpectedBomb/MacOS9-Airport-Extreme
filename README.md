@@ -10,9 +10,9 @@ with its own hardware: it scans, joins WPA2-secured or open networks, remembers 
 own at start-up, all from a native control panel and Control Strip module, with no Mac OS X involved.
 
 > **Status: working on real hardware.** WPA2-Personal and open-network joins are tested on a Power Mac G4
-> MDD with an A1026 (BCM4306) card and on a BCM4318 PCI card (Linksys WMP54GS) at full 802.11g speed. New
-> in this release: support for the earliest A1026 cards, which use an older revision of the BCM4306
-> (confirmed on a PowerBook5,1). It is a hobby project, offered as-is; see [Limitations](#limitations).
+> MDD with an A1026 (BCM4306) card and on a BCM4318 PCI card (Linksys WMP54GS) at full 802.11g speed. Since
+> 2.0 it also supports the earliest A1026 cards, which use an older revision of the BCM4306 (confirmed on a
+> PowerBook5,1). It is a hobby project, offered as-is; see [Limitations](#limitations).
 
 ## What you get
 
@@ -141,10 +141,17 @@ Open the **AirPort Extreme** control panel (or the Control Strip), pick a networ
 WPA2 network type the password once. The Mac stores it in **AirPort Extreme Known Networks** (in the
 Preferences folder) and rejoins on its own at every start-up. Open networks join with no password.
 
+Energy Saver's sleep timer works while you are connected (since 2.0.1): the driver does nothing while the
+connection is idle, so the Mac goes to sleep on schedule. Before 2.0.1 it kept the Mac awake.
+
 ## Security
 
 **WPA2-Personal** (PSK, CCMP) and **open** networks. A WPA3-transition network joins through its WPA2 half.
 Not supported: WEP, the original WPA/TKIP, WPA3-only (SAE), or 802.1X / Enterprise.
+
+Since 2.0.1 the driver refuses a frame too large for its receive buffer before decrypting it, drops replayed
+or duplicate encrypted frames, drops unencrypted data on a secured network, and abandons a join whose
+handshake fails its integrity check. Use 2.0.1 or later.
 
 ## Limitations
 

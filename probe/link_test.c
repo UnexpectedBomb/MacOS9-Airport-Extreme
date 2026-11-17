@@ -357,6 +357,304 @@ static void TestOffOn(ApLinkU32 base)
     Check("the why has words", strcmp(ApLinkWhyName(AP_LINK_WHY_OFF), "AirPort was turned off") == 0);
 }
 
+/* ==== k247: WHEN THE HEARTBEAT POSTS ===============================================================
+ *
+ * What would make these fail:
+ *   - ApLinkTryDue disagreeing with the rule ApLinkStep used through build 246 in any state (the refactor);
+ *   - ApLinkWant posting while the link is up and quiet (the bug this build fixes: every post is activity to
+ *     Mac OS), or while AirPort is off;
+ *   - ApLinkWant NOT posting for a kick, a command, a silence, the boot scan, new log lines or a due rejoin
+ *     (the driver would miss work), or posting LOG or TRY faster than its ceiling;
+ *   - a reason the body does not consume, which shows up in the pump model as posts piling up;
+ *   - the hint-driven body making a join attempt, or declaring a loss, at a different tick from a body that
+ *     runs on EVERY tick (the ideal the old keepalive approximated). */
+
+/* The down half of ApLinkStep exactly as it was written through build 246, kept here so the refactor into
+ * ApLinkTryDue is checked against the original rule rather than against itself. */
+static int OldDownTry(const ApLink *L, ApLinkU32 now, ApLinkU32 lastBeacon, int beaconSeen)
+{
+    int audible;
+    if ((int)(now - L->nextTick) < 0) return 0;
+    audible = beaconSeen && ApLinkAge(now, lastBeacon) < AP_LINK_AUDIBLE_TICKS;
+    if (!audible) {
+        ApLinkU32 since = ApLinkAge(now, L->tried ? L->lastTryTick : L->downTick);
+        if (since < ApLinkFallbackTicks(L->fails)) return 0;
+    }
+    return 1;
+}
+
+static void TestTryDue(ApLinkU32 base)
+{
+    ApLink L; unsigned fails; int tried, seen, dn, dl, db; unsigned n = 0, bad = 0, due = 0;
+    char what[160];
+    ApLinkU32 now = base + 5000u;
+    for (fails = 0; fails <= 6; fails++)
+     for (tried = 0; tried <= 1; tried++)
+      for (seen = 0; seen <= 1; seen++)
+       for (dn = -12; dn <= 12; dn += 3)              /* now - nextTick: future through past */
+        for (dl = 0; dl <= 1300; dl += 13)            /* now - lastTryTick (downTick 7 earlier) */
+         for (db = -2; db <= 10; db++) {              /* now - lastBeacon: stamped after now .. 2.5 s ago */
+            int a, b;
+            memset(&L, 0, sizeof L);
+            L.fails = fails; L.tried = tried;
+            L.nextTick = now - (ApLinkU32)dn;
+            L.lastTryTick = now - (ApLinkU32)dl; L.downTick = now - (ApLinkU32)dl - 7u;
+            a = ApLinkTryDue(&L, now, now - (ApLinkU32)db, seen);
+            b = OldDownTry(&L, now, now - (ApLinkU32)db, seen);
+            n++; if (a != b) bad++; if (a) due++;
+         }
+    snprintf(what, sizeof what, "[base %08x] ApLinkTryDue == the build-246 rule in all %u states (%u due)",
+             base, n, due);
+    Check(what, bad == 0u && due > 0u && due < n);
+    memset(&L, 0, sizeof L); L.up = 1;
+    Check("ApLinkTryDue: never while up", !ApLinkTryDue(&L, now, now, 1));
+    memset(&L, 0, sizeof L); L.off = 1;
+    Check("ApLinkTryDue: never while off, even with the AP audible", !ApLinkTryDue(&L, now, now, 1));
+}
+
+/* Facts for an up, quiet, settled link: beacons this tick, scan done, nothing pending. */
+static ApLinkWantFacts QuietUp(ApLinkU32 now)
+{
+    ApLinkWantFacts w;
+    memset(&w, 0, sizeof w);
+    w.now = now; w.up = 1; w.monitoring = 1; w.radioOn = 1; w.lastBeacon = now; w.beaconSeen = 1;
+    w.canTry = 1; w.scanDone = 1; w.scanTick = now - 1000u; w.lastFlush = now - 5000u;
+    w.lastTryPost = now - 5000u; w.logWritable = 1;
+    return w;
+}
+
+static void TestWant(ApLinkU32 base)
+{
+    ApLink L; ApLinkWantFacts w; ApLinkU32 t; int bad;
+    char what[160];
+    ApLinkInit(&L, 1, base, 0);
+
+    /* ★ THE FIX: up and quiet for an hour -- not one post */
+    bad = 0;
+    for (t = base; t != base + 14400u; t++) { w = QuietUp(t); if (ApLinkWant(&L, &w) != AP_LINK_WANT_NONE) bad = 1; }
+    snprintf(what, sizeof what, "[base %08x] up and quiet for 1 hour: NO post (build 246 posted 720)", base);
+    Check(what, !bad);
+    /* ... and with AirPort off, whatever the air does */
+    {   ApLink O; ApLinkInit(&O, 1, base, 0); ApLinkTurnOff(&O, base);
+        bad = 0;
+        for (t = base; t != base + 14400u; t++) {
+            w = QuietUp(t); w.up = 0; w.radioOn = 0;
+            if (ApLinkWant(&O, &w) != AP_LINK_WANT_NONE) bad = 1; }
+        Check("AirPort off for 1 hour: NO post (build 246 posted every 5 s)", !bad); }
+
+    /* each reason, alone */
+    w = QuietUp(base + 10u); w.events = 1;
+    Check("a pending event -> EVENT", ApLinkWant(&L, &w) == AP_LINK_WANT_EVENT);
+    w = QuietUp(base + 10u); w.command = 1;
+    Check("a pending UI command -> COMMAND", ApLinkWant(&L, &w) == AP_LINK_WANT_COMMAND);
+    w = QuietUp(base + 10u); w.command = 1; w.up = 0; w.radioOn = 0;
+    Check("a command is posted with AirPort off too (it is how AirPort comes back on)", ApLinkWant(&L, &w) == AP_LINK_WANT_COMMAND);
+    w = QuietUp(base + 100u); w.events = 1; w.command = 1; w.lastBeacon = base;
+    Check("several reasons: the event first", ApLinkWant(&L, &w) == AP_LINK_WANT_EVENT);
+
+    w = QuietUp(base + 100u); w.lastBeacon = base + 100u - (AP_LINK_LOSS_TICKS - 1u);
+    Check("silence one tick short of the loss: no post", ApLinkWant(&L, &w) == AP_LINK_WANT_NONE);
+    w.lastBeacon = base + 100u - AP_LINK_LOSS_TICKS;
+    Check("silence at the loss threshold -> SILENT", ApLinkWant(&L, &w) == AP_LINK_WANT_SILENT);
+    w.monitoring = 0;
+    Check("silence while the pump is not running proves nothing: no post", ApLinkWant(&L, &w) == AP_LINK_WANT_NONE);
+
+    w = QuietUp(base + 100u); w.scanDone = 0; w.scanTick = 0u;
+    Check("boot scan not yet stamped -> SCAN", ApLinkWant(&L, &w) == AP_LINK_WANT_SCAN);
+    w.scanTick = base + 100u - (AP_LINK_SCAN_WAIT_TICKS - 1u);
+    Check("boot scan stamped, wait not over: no post", ApLinkWant(&L, &w) == AP_LINK_WANT_NONE);
+    w.scanTick = base + 100u - AP_LINK_SCAN_WAIT_TICKS;
+    Check("boot scan wait over -> SCAN", ApLinkWant(&L, &w) == AP_LINK_WANT_SCAN);
+    w.radioOn = 0;
+    Check("boot scan never with the radio off", ApLinkWant(&L, &w) == AP_LINK_WANT_NONE);
+
+    w = QuietUp(base + 100u); w.newLines = 1; w.lastFlush = base + 100u - (AP_LINK_FLUSH_TICKS - 1u);
+    Check("new log lines within 10 s of the last write: no post", ApLinkWant(&L, &w) == AP_LINK_WANT_NONE);
+    w.lastFlush = base + 100u - AP_LINK_FLUSH_TICKS;
+    Check("new log lines, 10 s since the last write -> LOG", ApLinkWant(&L, &w) == AP_LINK_WANT_LOG);
+    w.newLines = 0;
+    Check("no new lines: no post however long since the write", ApLinkWant(&L, &w) == AP_LINK_WANT_NONE);
+    w = QuietUp(base + 100u); w.newLines = 1; w.up = 0; w.canTry = 0; w.logWritable = 0;
+    Check("new lines while down after being up (the write is HELD, never behind AppleShare): no post",
+          ApLinkWant(&L, &w) == AP_LINK_WANT_NONE);
+    w.logWritable = 1;
+    Check("new lines on a first load whose link never came up, no network chosen (k245): LOG",
+          ApLinkWant(&L, &w) == AP_LINK_WANT_LOG);
+    w = QuietUp(base + 100u); w.newLines = 1; w.up = 0; w.radioOn = 0; w.logWritable = 0;
+    Check("new lines with AirPort off after being up (held): no post", ApLinkWant(&L, &w) == AP_LINK_WANT_NONE);
+
+    /* down: the rejoin schedule, through ApLinkTryDue */
+    {   ApLink D; ApLinkInit(&D, 1, base, 0);
+        w = QuietUp(base + 200u); w.lastBeacon = base + 200u - AP_LINK_LOSS_TICKS;
+        {   ApLinkFacts f; memset(&f, 0, sizeof f);
+            f.now = base + 200u; f.lastBeacon = w.lastBeacon; f.beaconSeen = 1; f.monitoring = 1;
+            (void)ApLinkStep(&D, &f); }                                  /* lost by silence: due at once */
+        w.up = 0; w.lastBeacon = base + 200u;                            /* the AP audible again */
+        Check("down, due, audible -> TRY", ApLinkWant(&D, &w) == AP_LINK_WANT_TRY);
+        w.canTry = 0;
+        Check("down but no network chosen or its key refused: no post (nothing to attempt)",
+              ApLinkWant(&D, &w) == AP_LINK_WANT_NONE);
+        w.canTry = 1; w.radioOn = 0;
+        Check("down with the radio off: no post", ApLinkWant(&D, &w) == AP_LINK_WANT_NONE);
+        w.radioOn = 1; w.lastTryPost = base + 200u - (AP_LINK_TRY_POST_TICKS - 1u);
+        Check("TRY ceiling: not within 1 s of the previous TRY post", ApLinkWant(&D, &w) == AP_LINK_WANT_NONE);
+        w.lastTryPost = base + 200u - AP_LINK_TRY_POST_TICKS;
+        Check("TRY ceiling: again after 1 s", ApLinkWant(&D, &w) == AP_LINK_WANT_TRY);
+        ApLinkAttempted(&D, base + 200u, 0);                             /* failed: next in 1 s */
+        w.lastTryPost = base + 200u;
+        w.now = base + 203u; w.lastBeacon = base + 203u;
+        Check("a failed attempt is followed by its backoff, not a post", ApLinkWant(&D, &w) == AP_LINK_WANT_NONE);
+        w.now = base + 204u; w.lastBeacon = base + 204u;
+        Check("...and a post when the backoff ends", ApLinkWant(&D, &w) == AP_LINK_WANT_TRY); }
+    Check("the reasons have words", strcmp(ApLinkWantName(AP_LINK_WANT_TRY), "rejoin") == 0
+          && strcmp(ApLinkWantName(AP_LINK_WANT_LOG), "log") == 0);
+}
+
+/* ---- the pump model --------------------------------------------------------------------------------
+ * The driver around ap_link.h, in two forms, against TestWorld's scripted AP (restart, deauths, a busy
+ * spell, a replaced BSSID) over 30 minutes:
+ *   IDEAL   the body runs on EVERY tick (what the old keepalive approximated at 1-5 s);
+ *   HINTED  the body runs only when ApLinkWant asks, `lat` ticks after the post, one post in flight.
+ * The body is the driver's: drain events, ApLinkStep, one attempt on TRY, the boot scan, a status line at most
+ * every 30 s up / 10 s down, and ApLinkMaybeFlush's write (10-s gate, held while down, seen-count bookkeeping).
+ * Log lines are counted, not written. */
+typedef struct {
+    ApLink   L;
+    int      upFlag, radioOn, scanDone, everUp;
+    ApLinkU32 scanTick, lastHb, lastFlush, lastTryPost;
+    unsigned long ring, flushed, seenN;
+    unsigned events;                        /* event-ring entries not yet drained */
+    unsigned posts[AP_LINK_WANT_N], bodies, tries, downs, scans, flushes;
+    ApLinkU32 tryTick[64], downTick[64], scanTickRun;
+} Drv;
+
+static void DrvInit(Drv *d, ApLinkU32 t0)
+{
+    memset(d, 0, sizeof *d);
+    ApLinkInit(&d->L, 1, t0, 0);
+    d->upFlag = 1; d->radioOn = 1; d->everUp = 1;
+    d->lastHb = t0; d->lastFlush = t0; d->lastTryPost = t0 - AP_LINK_TRY_POST_TICKS;
+    d->ring = 8;                            /* the link-watch banner, not yet written */
+}
+
+static void DrvFlush(Drv *d, ApLinkU32 t, int event)
+{
+    if (!(d->ring > d->flushed)) return;
+    if (!d->upFlag && d->everUp) { d->seenN = d->ring; return; }          /* held: never behind AppleShare */
+    if (!event && ApLinkAge(t, d->lastFlush) < AP_LINK_FLUSH_TICKS) return;
+    d->flushed = d->ring; d->lastFlush = t; d->seenN = d->ring; d->flushes++;
+}
+
+/* world: apOn / busy / bssOk at tick t; kick sequence; the join succeeds iff the AP is on, not busy, and the
+ * BSSID is current -- or it re-learns a replaced one. */
+static void DrvBody(Drv *d, ApLinkU32 t, ApLinkU32 lastB, int seen, ApLinkU32 kick, int monitoring,
+                    int apOn, int busy, int *bssOk)
+{
+    ApLinkFacts f; int a, event = 0;
+    d->bodies++;
+    if (d->events) { d->events = 0; d->ring += 1; event = 1; }          /* drained and printed */
+    memset(&f, 0, sizeof f);
+    f.now = t; f.lastBeacon = lastB; f.beaconSeen = seen; f.kickSeq = kick;
+    f.kickKind = AP_LINK_MGMT_DEAUTH; f.kickReason = 7; f.monitoring = monitoring;
+    a = ApLinkStep(&d->L, &f);
+    if (a == AP_LINK_ACT_WENT_DOWN) {
+        d->upFlag = 0; d->ring += 3; event = 1;
+        if (d->downs < 64u) d->downTick[d->downs] = t;
+        d->downs++;
+    } else if (a == AP_LINK_ACT_TRY) {
+        int ok = apOn && !busy;
+        if (ok && !*bssOk) *bssOk = 1;
+        ApLinkAttempted(&d->L, t, ok);
+        d->upFlag = d->L.up; d->ring += 5; event = 1;
+        if (d->tries < 64u) d->tryTick[d->tries] = t;
+        d->tries++;
+    }
+    if (!d->scanDone && d->upFlag && d->radioOn) {
+        if (d->scanTick == 0u) d->scanTick = t ? t : 1u;
+        else if (ApLinkAge(t, d->scanTick) >= AP_LINK_SCAN_WAIT_TICKS) {
+            d->scanDone = 1; d->scans++; d->scanTickRun = t; d->ring += 2; event = 1; } }
+    if (!d->upFlag) d->scanTick = 0u;
+    if (ApLinkAge(t, d->lastHb) >= ((d->L.up || d->L.off) ? 120u : 40u)) { d->ring += 2; d->lastHb = t; }
+    DrvFlush(d, t, event);
+}
+
+/* Returns the HINTED driver's posts in [quietFrom, quietTo) (an up-and-quiet stretch of the script). */
+static unsigned RunPumpModel(Drv *d, int hinted, unsigned lat, ApLinkU32 quietFrom, ApLinkU32 quietTo)
+{
+    ApLinkU32 t, lastB = 0, kick = 0, postTick = 0; int seen = 1, monitoring = 1, bssOk = 1, posted = 0;
+    unsigned quietPosts = 0;
+    DrvInit(d, 0u);
+    for (t = 1; t < 30u * 60u * 4u; t++) {
+        int apOn = !(t >= 480u && t < 720u);
+        int busy = (t >= 2800u && t < 2880u);
+        if (t == 1600u || t == 2800u) { kick++; d->events++; }        /* a deauth: the pump records an event */
+        if (t == 4400u) bssOk = 0;
+        if (t == 6000u) d->ring += 4;          /* lines from outside the body (an OT entry point), link up */
+        if (apOn && monitoring && bssOk) { lastB = t; seen = 1; }
+        if (!hinted) { DrvBody(d, t, lastB, seen, kick, monitoring, apOn, busy, &bssOk); continue; }
+        if (!posted) {
+            ApLinkWantFacts w; int why;
+            memset(&w, 0, sizeof w);
+            w.now = t; w.events = d->events != 0u; w.command = 0; w.up = d->upFlag; w.monitoring = monitoring;
+            w.radioOn = d->radioOn; w.lastBeacon = lastB; w.beaconSeen = seen; w.canTry = 1;
+            w.scanDone = d->scanDone; w.scanTick = d->scanTick;
+            w.newLines = d->ring > d->flushed && d->ring != d->seenN;
+            w.logWritable = d->upFlag || !d->everUp;            /* DrvFlush's hold rule, inverted */
+            w.lastFlush = d->lastFlush; w.lastTryPost = d->lastTryPost;
+            why = ApLinkWant(&d->L, &w);
+            if (why != AP_LINK_WANT_NONE) {
+                posted = 1; postTick = t; d->posts[why]++;
+                if (why == AP_LINK_WANT_TRY) d->lastTryPost = t;
+                if (t >= quietFrom && t < quietTo) quietPosts++;
+            }
+        }
+        if (posted && t - postTick >= lat) { posted = 0; DrvBody(d, t, lastB, seen, kick, monitoring, apOn, busy, &bssOk); }
+    }
+    return quietPosts;
+}
+
+static void TestPumpModel(void)
+{
+    static Drv ideal, h0, h3;
+    unsigned i, total0 = 0, total3 = 0, q0, q3, same = 1;
+    char what[200];
+    (void)RunPumpModel(&ideal, 0, 0u, 0u, 0u);
+    /* up and quiet: after the restart's rejoin settles (~181 s) until the deauth at 400 s */
+    q0 = RunPumpModel(&h0, 1, 0u, 1000u, 1600u);
+    q3 = RunPumpModel(&h3, 1, 3u, 1000u, 1600u);
+    for (i = 1; i < AP_LINK_WANT_N; i++) { total0 += h0.posts[i]; total3 += h3.posts[i]; }
+
+    /* the hinted body (latency 0) makes the ideal's decisions at the ideal's ticks */
+    if (h0.tries != ideal.tries || h0.downs != ideal.downs || h0.scans != ideal.scans
+        || h0.scanTickRun != ideal.scanTickRun) same = 0;
+    for (i = 0; same && i < ideal.tries && i < 64u; i++) if (h0.tryTick[i] != ideal.tryTick[i]) same = 0;
+    for (i = 0; same && i < ideal.downs && i < 64u; i++) if (h0.downTick[i] != ideal.downTick[i]) same = 0;
+    snprintf(what, sizeof what, "pump model: the hinted body makes every attempt and loss at the same tick as a "
+             "body run on every tick (%u attempts, %u losses)", ideal.tries, ideal.downs);
+    Check(what, same && ideal.tries > 0u && ideal.downs > 0u);
+    Check("pump model: the boot scan ran once, 5 s after the start, in both", ideal.scans == 1u && h0.scans == 1u
+          && h0.scanTickRun == 1u + AP_LINK_SCAN_WAIT_TICKS);
+
+    /* ★ up and quiet: nothing */
+    snprintf(what, sizeof what, "pump model: up and quiet for 150 s: %u posts (latency 0) / %u (latency 3)", q0, q3);
+    Check(what, q0 == 0u && q3 == 0u);
+    /* every reason consumed: the whole 30 minutes costs a bounded number of posts (build 246 posted every 5 s up,
+     * every 1 s down, whatever happened) */
+    snprintf(what, sizeof what, "pump model: 30 min of outages, deauths and rejoins in %u posts (latency 0) / %u "
+             "(latency 3) -- every reason consumed by its body", total0, total3);
+    Check(what, total0 < 120u && total3 < 120u);
+    Check("pump model: one TRY post per attempt (no wasted rejoin posts)", h0.posts[AP_LINK_WANT_TRY] == h0.tries);
+    Check("pump model, latency 3: still ends up, every outage ended, bounded effort",
+          h3.L.up && h3.L.rejoins >= 4u && h3.tries < 40u);
+    Check("pump model: lines written outside a body cost exactly one LOG post (then nothing)",
+          h0.posts[AP_LINK_WANT_LOG] == 1u && h3.posts[AP_LINK_WANT_LOG] == 1u);
+    Check("pump model: every log line reached the disk by the end (lines held while down go with the rejoin)",
+          h0.flushed == h0.ring && h3.flushed == h3.ring && ideal.flushed == ideal.ring);
+    printf("  pump model: posts by reason (latency 0) event %u, command %u, silence %u, scan %u, log %u, rejoin %u;"
+           " bodies %u of %u ticks\n", h0.posts[1], h0.posts[2], h0.posts[3], h0.posts[4], h0.posts[5], h0.posts[6],
+           h0.bodies, 30u * 60u * 4u);
+}
+
 int main(void)
 {
     TestClassifiers();
@@ -367,6 +665,11 @@ int main(void)
     TestOffOn(0u);
     TestOffOn(0xFFFFE000u);                 /* and the off/on scenarios across the wrap */
     TestWorld();
+    TestTryDue(0u);
+    TestTryDue(0xFFFFFF00u);                /* k247: the refactor, across the wrap too */
+    TestWant(0u);
+    TestWant(0xFFFFC000u);
+    TestPumpModel();
     printf(gFails ? "  [!!] %d of %d checks FAILED\n" : "  [ok] %d checks, %d failed\n",
            gFails ? gFails : gChecks, gFails ? gChecks : 0);
     return gFails ? 1 : 0;
