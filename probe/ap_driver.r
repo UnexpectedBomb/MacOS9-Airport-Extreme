@@ -10,12 +10,16 @@
  *   version is a plain number for end users ("call this version 2.0 for the sake of simplicity"), and Get Info
  *   shows THE VERSION ONLY: no description, no changelog, no build number. 2.0 = build 245, 2.0.1 = build
  *   247 (build 246 was 2.0.1's first candidate, held back by the user on 2026-11-16 so that one release would
- *   carry both its security fixes and the idle-sleep fix). The build stays visible where diagnosis needs it:
- *   the driver log's "OTMODL build NNN" and the panel's About box.
+ *   carry both its security fixes and the idle-sleep fix), 2.0.2 = build 248. The build stays visible where
+ *   diagnosis needs it: the driver log's "OTMODL build NNN" and the panel's About box.
  * ⚠ DEVELOPMENT BUILDS carry their build in the STRINGS, as 1.0b239d..1.0b245d did, so that Get Info tells a
  *   test build from the release it sits on (build 247 was tested as "2.0.1b247d"). A release goes back to the
  *   plain number in both strings and changes nothing else: 2.0.1's data fork is byte-identical to the tested
- *   2.0.1b247d's. The NUMERIC bytes are the user's call. */
+ *   2.0.1b247d's. The NUMERIC bytes are the user's call.
+ * ⚠ k248 (user, 2026-11-17: "go ahead with the retry as 2.0.2"): numeric 2.0.2; build 248 is tested as "2.0.2b248d",
+ *   and its fault-injection variant (cmake -DAP_TEST_PHY_FAIL_ONCE=ON: the first PHY verdict reported as a failure,
+ *   so the retry runs) as "2.0.2b248t". 2.0.2 is plain "2.0.2" over build 248's data fork, byte-identical to the
+ *   tested 2.0.2b248d's (both hardware parts passed 2026-11-17). The test variant keeps its own label. */
 #include "Types.r"
 #include "ap_driver_cfrg.r"    /* generated: the 3-member cfrg. Rez include is invisible to CMake --
                                 * listed in the DEPENDS of the Rez command in CMakeLists. */
@@ -28,15 +32,25 @@
  * numeric was 0x01,0x99: left over from k198/k199 using those bytes as a build counter, which ASP displayed
  * as "1.9.9b245". */
 resource 'vers' (1, locked) {
-    0x02, 0x01, 0x80, 0x00, verUS,
-    "2.0.1",
-    "2.0.1"
+    0x02, 0x02, 0x80, 0x00, verUS,
+#ifdef AP_TEST_PHY_FAIL_ONCE
+    "2.0.2b248t",
+    "2.0.2b248t"
+#else
+    "2.0.2",
+    "2.0.2"
+#endif
 };
 
 /* RELEASE HISTORY: source record only, never compiled (#if 0). Until 2.0 this text was vers 1's long string,
  * and Rez kept only its first 255 bytes. The development builds between 1.0b235 and 2.0 (1.0b239d, 1.0b241d,
  * 1.0b243d, 1.0b244d, 1.0b245d) are summarised in the 2.0 entry; their own notes are in git history. */
 #if 0
+    "(2.0.2, build 248: AIRPORT COMES BACK BY ITSELF AFTER A FAILED START-UP. Occasionally, after a wake from "
+    "sleep, one of the driver's start-up self-checks failed (a radio register did not read back the value just "
+    "restored), and 2.0.1 then left AirPort off until TCP/IP was switched to another port and back. The driver "
+    "now resets the card and starts it once more by itself, as that switch did; the checks are as strict as "
+    "before. Restart normally.) "
     "(2.0.1, build 247: SECURITY FIXES, AND IDLE SLEEP ON AIRPORT. A data frame too large for the receive "
     "buffer is refused before it is decrypted (2.0 could overwrite driver memory with one forged frame from "
     "anyone in range); a handshake message 3 that fails its check ends the join attempt instead of completing "
@@ -211,7 +225,12 @@ resource 'vers' (1, locked) {
 #endif
 
 resource 'vers' (2, locked) {
-    0x02, 0x01, 0x80, 0x00, verUS,
-    "2.0.1",
-    "AirPort Extreme 2.0.1"
+    0x02, 0x02, 0x80, 0x00, verUS,
+#ifdef AP_TEST_PHY_FAIL_ONCE
+    "2.0.2b248t",
+    "AirPort Extreme 2.0.2b248t"
+#else
+    "2.0.2",
+    "AirPort Extreme 2.0.2"
+#endif
 };

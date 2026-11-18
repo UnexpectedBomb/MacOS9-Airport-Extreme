@@ -144,6 +144,10 @@ Preferences folder) and rejoins on its own at every start-up. Open networks join
 Energy Saver's sleep timer works while you are connected (since 2.0.1): the driver does nothing while the
 connection is idle, so the Mac goes to sleep on schedule. Before 2.0.1 it kept the Mac awake.
 
+If the card does not start up cleanly, which has been seen occasionally after a wake from sleep, the driver
+restarts the card and tries once more by itself (since 2.0.2). Before 2.0.2, AirPort stayed off until TCP/IP was
+switched to another port and back.
+
 ## Security
 
 **WPA2-Personal** (PSK, CCMP) and **open** networks. A WPA3-transition network joins through its WPA2 half.

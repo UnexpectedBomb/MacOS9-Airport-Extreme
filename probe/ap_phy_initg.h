@@ -870,9 +870,19 @@ static void CalcLoopbackGain(void)
         { Str255 L;L[0]=0;PCat(L,"      ✗ PHY 0x");PCatHex(L,regs[z],4);
           PCat(L,"  want 0x");PCatHex(L,want[z],4);
           PCat(L,"  got 0x");PCatHex(L,got,4);Out(L); } } }
-    if(RadioRead(0x0052)!=bradio[0]) gLbRestoreBad++;
-    if(RadioRead(0x0043)!=bradio[1]) gLbRestoreBad++;
-    if(RadioRead(0x007A)!=bradio[2]) gLbRestoreBad++; }
+    /* ⚠ k248: OUTPUT ONLY, Oracle N's k40 change applied to Oracle K. aspnodes2 (2026-11-11) failed this oracle with
+     * "restore mismatches = 1" and no PHY line above: one of these three radio registers, unnamed. Same three reads,
+     * same order, same count; a mismatch now names itself. */
+    { UInt16 g;
+      g = RadioRead(0x0052); if(g!=bradio[0]){ gLbRestoreBad++;
+        { Str255 L;L[0]=0;PCat(L,"      ✗ RADIO 0x0052  want 0x");PCatHex(L,bradio[0],4);
+          PCat(L,"  got 0x");PCatHex(L,g,4);Out(L); } }
+      g = RadioRead(0x0043); if(g!=bradio[1]){ gLbRestoreBad++;
+        { Str255 L;L[0]=0;PCat(L,"      ✗ RADIO 0x0043  want 0x");PCatHex(L,bradio[1],4);
+          PCat(L,"  got 0x");PCatHex(L,g,4);Out(L); } }
+      g = RadioRead(0x007A); if(g!=bradio[2]){ gLbRestoreBad++;
+        { Str255 L;L[0]=0;PCat(L,"      ✗ RADIO 0x007A  want 0x");PCatHex(L,bradio[2],4);
+          PCat(L,"  got 0x");PCatHex(L,g,4);Out(L); } } } }
 
   gLbOuter=outerDone; gLbInner=innerDone; gLbTrsw=trswRx;
   gLbMaxGain=(SInt16)(((innerDone*6)-(outerDone*4))-11);

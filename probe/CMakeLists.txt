@@ -464,6 +464,20 @@ set_target_properties(AirPortOTModl PROPERTIES
 target_link_libraries(AirPortOTModl NameRegistryLib PCILib DriverServicesLib InterfaceLib)
 target_compile_options(AirPortOTModl PRIVATE -Wno-unused-function)
 
+# ⚠ k248: the fault-injection TEST variant, never a release. In its own tree:
+#     cmake -B build-test -DAP_TEST_PHY_FAIL_ONCE=ON ... && cmake --build build-test --target AirPortDriver
+# The first PHY verdict of each load is reported as a failure, so the retry from a core reset runs on a card that
+# would have passed; vers reads "2.0.2b248t" (ap_driver.r). ⚠ ap_driver_cfrg.r is generated into the SOURCE tree
+# from whichever tree built last: build this variant first and the normal one last (delete ap_driver_cfrg.r
+# between them), so the committed cfrg is the normal build's.
+option(AP_TEST_PHY_FAIL_ONCE "k248 TEST BUILD ONLY: report the first PHY verdict as a failure, so the retry runs" OFF)
+if(AP_TEST_PHY_FAIL_ONCE)
+    target_compile_definitions(AirPortOTModl PRIVATE AP_TEST_PHY_FAIL_ONCE=1)
+    set(AP_DRIVER_REZ_DEFS -D AP_TEST_PHY_FAIL_ONCE)
+else()
+    set(AP_DRIVER_REZ_DEFS)
+endif()
+
 # Single-member cfrg naming the fragment "OTModl$AirPortBCM". Same DEPENDS caveat as the shim: the
 # Rez #include of this file is invisible to CMake, so it must be listed on the Rez command below.
 add_custom_command(OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/ap_otmodl_cfrg.r
@@ -553,7 +567,7 @@ add_custom_command(OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/ap_driver_cfrg.r AirPortDr
 # The extension has no bundle, so no --bundle.
 set(AP_SET_ICON ${CMAKE_CURRENT_SOURCE_DIR}/../csm/scripts/set-custom-icon.py)
 add_custom_command(OUTPUT AirPortExtreme.shlb
-    COMMAND ${REZ} ${REZ_FLAGS} ${CMAKE_CURRENT_SOURCE_DIR}/ap_driver.r
+    COMMAND ${REZ} ${REZ_FLAGS} ${AP_DRIVER_REZ_DEFS} ${CMAKE_CURRENT_SOURCE_DIR}/ap_driver.r
             ${CMAKE_CURRENT_SOURCE_DIR}/ap_driver_icon.r
             ${REZ_INCLUDE_FLAG}
             -o AirPortExtreme.shlb --cc AirPortExtreme.shlb.bin

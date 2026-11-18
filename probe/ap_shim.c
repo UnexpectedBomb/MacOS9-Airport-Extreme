@@ -164,6 +164,9 @@ static void ApShimDumpRingToFile(void);
 #include "ap_gtk.h"     /* k208: group message 1 and the group keys by key index -- pure, gtk_test.c */
 #include "ap_scan.h"    /* k209: the beacon parser, the scan table, the null frame -- pure, scan_test.c */
 #include "ap_known.h"   /* k210: the known networks + the Preferences-file form -- pure, known_test.c */
+#include "ap_phy_reset.h" /* k248: ApPhyInitGResetState, so ApPhyInitG can run twice in one load (the retry
+                         * in ApShimRadioBringUp). After ap_eapol.h, whose chain declares ap_phy_initg.h's
+                         * variables; check-phy-reset.py proves the reset covers every one of them. */
 
 /* k208: ap_gtk.h carries its own copy of the EAPOL-Key layout, because ap_eapol.h cannot be compiled on the
  * host. A copy is exactly the hazard this project keeps paying for, so the two are pinned equal here, on
@@ -1325,9 +1328,22 @@ static void ApShimRadioOn(void)
  *   exactly this, after MEASURING a k69 log rather than reasoning about call-site counts. If the
  *   drop counter is non-zero in the log, the ring is too small again and the tail is missing --
  *   not the PHY stopping early. */
+/* k248: the retry's bookkeeping (ApShimRadioBringUp, below). gShimPhyRan = ApPhyInitG really ran and gave a
+ * verdict, as opposed to the prefix declining it (a retry could only decline the same way). gShimPhyTries = which
+ * bring-up this is, 1 or 2. gShimPhyRetries = retries made this load (0 or 1). */
+static int gShimPhyRan = 0;
+static int gShimPhyTries = 0;
+static int gShimPhyRetries = 0;
+
+#ifndef AP_TEST_PHY_FAIL_ONCE
+#define AP_TEST_PHY_FAIL_ONCE 0     /* ⚠ k248 TEST BUILD ONLY (cmake -DAP_TEST_PHY_FAIL_ONCE=ON, Get Info "2.0.2b248t"):
+                                     * 1 = the first ApPhyInitG verdict of each load is reported as a FAILURE, so the
+                                     * retry runs on a card that would have passed. Never in a release. */
+#endif
+
 static void ApShimPhyInit(void)
 {
-    if(gShimPhyErr != 1) return;                /* once per load */
+    if(gShimPhyErr != 1) return;                /* once per bring-up (k248: the retry resets it) */
     if(!gShimRadioOn){
       Say("");
       Say("  [8-2d-3] PHY INIT DECLINED -- the prefix did not complete.");
@@ -1337,10 +1353,87 @@ static void ApShimPhyInit(void)
       return; }
     Say("");
     Say("  [8-2d-3] ★★★ ApPhyInitG() -- b43_phy_init, all fifteen Stage 4 oracles");
+    gShimPhyRan = 1;
     gShimPhyOk  = ApPhyInitG();
+#if AP_TEST_PHY_FAIL_ONCE
+    if(gShimPhyOk && gShimPhyTries <= 1){
+      Say("  [k248] ⚠ TEST BUILD (AP_TEST_PHY_FAIL_ONCE): this first verdict PASSED and is reported as a FAILURE on");
+      Say("    purpose, so that the retry runs. A release build never does this.");
+      gShimPhyOk = 0; }
+#endif
     gShimPhyErr = gShimPhyOk ? noErr : paramErr;
     Say(gShimPhyOk ? "  [8-2d-3] ★★★★★ ApPhyInitG returned 1 -- every Stage 4 oracle passed"
                    : "  [8-2d-3] [!!] ApPhyInitG returned 0 -- an oracle failed, see above");
+}
+
+/* ★★★ k248: ONE RETRY FROM A CORE RESET WHEN A STAGE 4 ORACLE FAILS.
+ *
+ * 2.0.1 ran the bring-up once per load and stopped for good on any failed oracle: chip_init's tail, DMA, the MAC and
+ * the join all declined, and the card stayed down until Open Transport loaded the driver again. On the FW800
+ * (2026-11-17, claude-os9 firewire-fw800/logs/uwake21A-idle-usb2-hw-2026-11-17) the reload after a wake failed
+ * Oracle N on one restore readback, `RADIO 0x007A want 0x007F got 0x007C`; k98 (2026-09-22) failed on the identical
+ * readback, and aspnodes2's Oracle K failure (2026-11-11) was one of the three radio registers that oracle compared
+ * without naming. Switching TCP/IP to Ethernet and back -- a fresh load: fresh data, a core reset, the whole
+ * bring-up -- recovered each time.
+ *
+ * So the driver now does that reload's work itself, once: reset the core and run the bring-up again from the core
+ * reset through ApPhyInitG. Prior art: b43's own recovery is this shape (main.c b43_chip_reset: wireless_core_exit,
+ * then wireless_core_init = the core reset, chip_init with the microcode, initvals, GPIO and radio, then phy_init).
+ * The oracles stay exactly as strict: a retry that also fails stops where 2.0.1 stopped.
+ *
+ * ⚠ WHAT MAKES IT A RETRY AND NOT A SECOND, DIFFERENT RUN: every "once per load" guard the steps keep, and every
+ *   value they leave for the next step, goes back to what a fresh load starts with (ApShimResetForRetry), and
+ *   ApPhyInitG's own ~100 file-scope variables with it (ApPhyInitGResetState, ap_phy_reset.h; check-phy-reset.py).
+ *   Kept: the card itself (gBus, the backplane scan, the arm). Nothing past ApPhyInitG has run yet when a retry
+ *   happens -- no DMA ring, no MAC, no interrupt -- so nothing else needs undoing.
+ * ⚠ Only a verdict is retried. If the prefix never reached ApPhyInitG (the core did not come up, the microcode or
+ *   the initvals were refused), the retry would decline in the same place, so it is not attempted. */
+static void ApShimResetForRetry(void)
+{
+    gShimCoreUp = 0; gShimCoreErr = 1; gShimCoreWasUp = 0; gShimTmsLow = 0;
+    gShimFwRev = 0; gShimFwIrq = 0; gShimFwErr = 1;
+    gShimFwPatch = 0; gShimFwDate = 0; gShimFwTime = 0; gShimFwStat = 0;
+    gShimFwPolls = 0; gShimFwMacctl = 0; gShimFwCoreRev = 0;
+    gShimIvApplied = 0; gShimIvDeclared = 0; gShimBsApplied = 0; gShimBsDeclared = 0; gShimIvErr = 1;
+    gShimGpioOk = 0; gShimBoardFlags = 0; gShimRadioOn = 0;
+    gShimPhyOk = 0; gShimPhyErr = 1; gShimPhyRan = 0;
+    ApPhyInitGResetState();
+}
+
+/* The core is already enabled by the caller for the first bring-up (ScanBackplane, EnableCore, then this); the retry
+ * enables it again itself, which is the core reset (SsbCoreEnable disables the core first). */
+static void ApShimRadioBringUp(void)
+{
+    int attempt;
+    for(attempt = 1; attempt <= 2; attempt++){
+      gShimPhyTries = attempt;
+      if(attempt > 1){
+        Say("");
+        ApDiagMark("  [k248] >> RETRY: a Stage 4 oracle failed (above). The core is reset and the radio brought up again,");
+        ApDiagMark("    as an Open Transport reload of the driver would do.");
+        ApShimResetForRetry();
+        gShimPhyRetries++;
+        ApDiagMark("  [k248] >> ApShimEnableCore (the core reset)");
+        ApShimEnableCore();
+      }
+      ApDiagMark("  [k244] >> ApShimLoadFirmware");
+      ApShimLoadFirmware();
+      ApShimSayFwResult();
+      ApDiagMark("  [k244] >> ApShimGpioInit");
+      ApShimGpioInit();
+      ApDiagMark("  [k244] >> ApShimApplyInitvals");
+      ApShimApplyInitvals();
+      ApDiagMark("  [k244] >> ApShimRadioOn");
+      ApShimRadioOn();
+      ApDiagMark("  [k244] >> ApShimPhyInit");
+      ApShimPhyInit();
+      if(gShimPhyOk || !gShimPhyRan) break;      /* passed, or the prefix declined: a retry would decline the same way */
+    }
+    if(gShimPhyRetries){
+      Say(gShimPhyOk ? "  [k248] ★★★ THE RETRY PASSED: every Stage 4 oracle passed on the second bring-up; the driver carries on."
+                     : "  [k248] [!!] THE RETRY FAILED TOO: the bring-up stops here, as it did before k248.");
+      ApShimDumpRingToFile();
+    }
 }
 
 /* 8-2d-3: the prefix and PHY results, for the app's oracle. */
@@ -8299,18 +8392,12 @@ int ApOtmHalOpen(void)
      * was the one at the very end. Each step is now announced AND flushed before it runs (ApDiagMark =
      * Say + flush), so a hang leaves that step's name as the log's last line, and the firmware result is
      * decoded and on disk before anything downstream touches the card. Same calls, same order; costs one
-     * FlushVol per step at boot. */
-    ApDiagMark("  [k244] >> ApShimLoadFirmware");
-    ApShimLoadFirmware();
-    ApShimSayFwResult();
-    ApDiagMark("  [k244] >> ApShimGpioInit");
-    ApShimGpioInit();
-    ApDiagMark("  [k244] >> ApShimApplyInitvals");
-    ApShimApplyInitvals();
-    ApDiagMark("  [k244] >> ApShimRadioOn");
-    ApShimRadioOn();
-    ApDiagMark("  [k244] >> ApShimPhyInit");
-    ApShimPhyInit();
+     * FlushVol per step at boot.
+     * ★ k248: the steps from the microcode to ApPhyInitG now run inside ApShimRadioBringUp, the same calls with the
+     *   same marks, plus ONE retry from a core reset when a Stage 4 oracle fails (2.0.1 stayed down until Open
+     *   Transport reloaded the driver). This is the native path, the one the shipping driver runs; the older shim
+     *   paths above keep the single pass. */
+    ApShimRadioBringUp();
     ApDiagMark("  [k244] >> ApShimChipInitTail");
     ApShimChipInitTail();
     ApDiagMark("  [k244] >> ApShimCoreInitMid");
